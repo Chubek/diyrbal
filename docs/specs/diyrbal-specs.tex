@@ -11,6 +11,31 @@
 
 \nm is a higher-order, high-level, type-safe, dynamically-typed, multi-paradigm, UNIX-native but portable scripting and programming language. It has been influenced, both in sytnax and semantics, and also in implementation, by the likes of Ruby, Perl, Scheme, Tcl and Python.
 
-To give an
+It's best to introduce \nm with a basic example. The factorial function should fit the occasion:
+
+\begin{diyrbalcode}
+	let fac <- fnrec
+		begin 
+			if !\$1 return 0; 
+			else return fac(\$1 - 1) * fac(\$1 - 2) 
+		end
+\end{diyrbalcode}
+
+\textbf{Do not} let the tacit\footnote{Meaning, the function definition does not specify formal parameters, and actual parameters -- i.e. arguments, are accessed by \texttt{\$1}} nature of above code turn you off the language! It also allows named formal parameters. We'll see that later.
+
+% TODO introduce the language more
+
+\section{Features of \nm}
+
+\nm boasts several multi-paradigm features found in other languages, or discussed in academic literature. Though it is a fully imperative language, functional programming is not fallen by the wayside in \nm. It is a big selling point for it. Since I plan on writing compilers with \nm, I wish to implement features that make verification of the code easier. One such feature is the \textit{Algebraic effect}.
+
+Algebraic effects are an alternative to monads for handling side-effects and stateful modifications. Within an Algebraic effect, one specifies an \textit{effect}, and then bundles that effect with state-altering constructs, and lets the \textit{handler} he specifies to take care of the effect.
+
+Another feature sported by \nm is built-in lexer/parser in form of \textit{grammars}. If your Perl 6 Vietnam flashbacks are going off right now, please keep in mind that grammars have always been an strong suite of the language, and \nm wishesh to follow in its footsteps by providing the user with a ready-made intrinsic lexer/parser.
+
+The interpreter also provides functional-style pattern-matching constructs. It might not be as modern as Algebraic effects, since pattern-matching has been around since the 70s, introduced by ML. But a modern language cannot survive without pattern matching!
+
+To accompany pattern-matching, \nm provides sum, product, and sum-of-product types. In other words, records and variants. Because of this, \nm does not feel the need to provide imperative-style enumeration types. In an scripting language, it's more likely that the programmer would use strings to enumerate anyways. \texttt{Option} and \texttt{Result} types are built-in into the language, this might sound inexusable, but the syntax for Option and Result differ from that of sum-of-product types used by other languages. So I stand by this choice!
+
 
 \end{document}
