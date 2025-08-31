@@ -39,4 +39,10 @@ To accompany pattern-matching, \nm provides sum, product, and sum-of-product typ
 
 The language also supports \textit{polymorphism}. Not the OOP-kind of polymorphism, rather, the system infuenced by System F\citework{tapl}. However, it is my belief that a \textit{faint} amount of OOP is necessary in a language that is targeted for both scripting, as well as scripting. So it supports \textit{roles} and \textit{protocols}. The roles are similar to typeclasses\citework{haskellstd} and protocols are similar to interfaces\citework{gostd}. The former is provided for functional programming, the latter, for imperative.
 
+\nm provides \textit{Green threads} for all its prallelism, and concurrency needs. Green threads are virtual threads, scheduled by the runtime, rather than the OS. \textit{However}, the backend decides to elavate a Green thread to an actual kernel-managed thread (or process) whenever it desires. If the user increases the maximum number of concurrent threads, which defaults to one, the runtime will comply and use kernel-managed threads to spread the scheduler across.
+
+Concurrency in \nm is spread around \textit{generators}, \textit{coroutines}, and \textit{coprocesses}. Generators are similar to Python generators, coroutines are asyncronous functions that return a promise, and coprocesses launch an entirely new instance of the interpreter, that uses IP methods to communicate with the current one.
+
+The language also supports chaining of expressions via piping, a la OCaml (\texttt{e\textsubscript{1} |> e\textsubscript{2}}), and composition of function, a la Haskell (\texttt{f\textsubscript{1} . f\textsubscript{2}}).
+
 \end{document}
