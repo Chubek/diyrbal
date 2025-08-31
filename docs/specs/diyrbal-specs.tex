@@ -9,7 +9,7 @@
 
 \section*{Preface}
 
-\nm is a higher-order, high-level, type-safe, dynamically-typed, multi-paradigm, UNIX-native but portable scripting and programming language. It has been influenced, both in sytnax and semantics, and also in implementation, by the likes of Ruby, Perl, Scheme, Tcl and Python.
+\nm is a higher-order, high-level, type-safe, dynamically- \& implicitly-typed, multi-paradigm, UNIX-native but portable scripting and programming language. It has been influenced, both in sytnax and semantics, and also in implementation, by the likes of Ruby, Perl, Scheme, Tcl and Python.
 
 It's best to introduce \nm with a basic example. The factorial function should fit the occasion:
 
@@ -44,5 +44,15 @@ The language also supports \textit{polymorphism}. Not the OOP-kind of polymorphi
 Concurrency in \nm is spread around \textit{generators}, \textit{coroutines}, and \textit{coprocesses}. Generators are similar to Python generators, coroutines are asyncronous functions that return a promise, and coprocesses launch an entirely new instance of the interpreter, that uses IP methods to communicate with the current one.
 
 The language also supports chaining of expressions via piping, a la OCaml (\texttt{e\textsubscript{1} |> e\textsubscript{2}}), and composition of function, a la Haskell (\texttt{f\textsubscript{1} . f\textsubscript{2}}).
+
+Support for first-class functions, and closures, is a given. \nm is a stateful, imperative language at heart, so it supports capturing of variables from surrounding environments in closures through the practice of upvalues\citework{luaclosures}. Upvalues are \textit{open} when the closure is created, and if the closure survives the parent, they are heap-boxed and \textit{closed} thusly.
+
+We discussed ADTs, or in fact, GADTs\footnote{\textit{Generalized} ADTs} as the functional type system for \nm. But the language also supports \textit{wobbly implicit typing}\citework{wobblytyping}, to implicitly annotate the GADTs, and \textit{gradual typing} for explicitly annotating imperative types.
+
+Imperative types in \nm come in form of \textit{bundles}. A bundle is a function that has been \textit{blessed}\footnote{As in, blessed bundle of joy} to be used as an object. In other words, bundles are \textit{prototypes}, similar to those found in JavaScript. A bundle could choose to follow an aforementioned \textit{protocol}.
+
+A \textit{role} is a construct similar to typeclasses in Haskell and traits in Rust. When an GADT chooses to \textit{follow} a role, it implements, fully or partially, the routines specified by the role.
+
+
 
 \end{document}
