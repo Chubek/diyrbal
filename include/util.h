@@ -16,6 +16,17 @@ splitmix_int_hash64 (uint64_t x)
 }
 
 static inline uint64_t
+robinhood_int_hash64 (uint64_t x)
+{
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return x;
+}
+
+static inline uint64_t
 fnv1a_str_hash64 (const uint8_t *s)
 {
   uint64_t h = 1469598103934665603ULL;
@@ -44,6 +55,12 @@ align_ptr (char *ptr)
 {
   uintptr_t addr = (uintptr_t)addr;
   return (char *)((addr + 7) & ~7);
+}
+
+static inline void
+move_to_new_addr (void **obj, void *new_addr)
+{
+  *obj = new_addr;
 }
 
 #endif
