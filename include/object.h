@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "tyydecl.h"
+#include "config.h"
 
 struct Value
 {
@@ -13,19 +14,21 @@ struct Value
     VAL_List,
     VAL_Array,
     VAL_Tuple,
+    VAL_String,
     VAL_Hash,
     VAL_Table,
     VAL_Closure,
     VAL_Prog,
     VAL_Upvalue,
     VAL_Frame,
+    VAL_Opstack,
   } type;
 
   union
   {
     struct List
     {
-      Value *head, *tail;
+      Object *head, *tail;
     } list;
 
     struct Array
@@ -40,12 +43,19 @@ struct Value
       size_t cnt;
     } tuple;
 
+    struct String
+    {
+      const uint8_t *buff;
+      size_t len, cap;
+      bool utf8;
+    } string;
+
     struct Hash
     {
       struct Entry
       {
-        Value *key;
-        Value *value;
+        Object *key;
+        Object *value;
         Entry *next;
       } *entries;
       bool *occupied;
@@ -54,8 +64,8 @@ struct Value
 
     struct Table
     {
-      Array *array_part;
-      Hash *hash_part;
+      Object *array_part;
+      Object *hash_part;
     } table;
 
     struct Closure
@@ -75,30 +85,37 @@ struct Value
     {
       Instr *instrs;
       size_t cnt, cap;
+      size_t insptr;
     } chunk;
 
     struct Frame
     {
       size_t sttlnk;
       size_t dynlnk;
-      Tuple *cnstpool;
+      size_t frmptr;
+      Object *cnstpool;
       Frame *prev;
     } frame;
-  } as;
 
-  bool marked;
-  Value *next;
-  Value *forwarding_addr;
+    struct Opstack
+    {
+      Object **oprs;
+      size_t nslots;
+      size_t stkptr;
+    } opstack;
+  } as;
 };
 
 struct Object
 {
+  Metatbl *mtbl;
   enum
   {
     OBJ_Value,
     OBJ_Integer,
     OBJ_Real,
     OBJ_Boolean,
+    OBJ_Symbol,
     OBJ_Nil,
   } type;
 
@@ -108,7 +125,13 @@ struct Object
     intmax_t integer;
     double real;
     bool boolean;
+    const char symbol[SYM_SIZE + 1];
   } as;
+
+  size_t size;
+  bool marked;
+  Object *next;
+  Object *forwarding_addr;
 };
 
 #endif
