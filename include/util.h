@@ -39,4 +39,11 @@ fnv1a_real_hash64 (double key)
   return hash;
 }
 
+static inline char *
+align_ptr (char *ptr)
+{
+  uintptr_t addr = (uintptr_t)addr;
+  return (char *)((addr + 7) & ~7);
+}
+
 #endif
