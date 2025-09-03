@@ -16,6 +16,7 @@
 #define OBJ_AsTuple(o) (o->as.value->as.tuple)
 #define OBJ_AsString(o) (o->as.value->as.string)
 #define OBJ_AsHash(o) (o->as.value->as.hash)
+#define OBJ_AsTyycls(o) (o->as.value->as.tyycls)
 #define OBJ_AsClosure(o) (o->as.value->as.closure)
 #define OBJ_AsBox(o) (o->as.value->as.box)
 #define OBJ_AsInteger(o) (o->as.integer)
@@ -76,6 +77,12 @@ struct Value
       bool *occupied;
       size_t cnt, cap;
     } hash;
+
+    struct Tyycls
+    {
+	Rule *rules;
+	size_t cntrules;
+    } tyycls;
 
     struct Closure
     {
@@ -196,5 +203,10 @@ void object_execute_closure (Closure *clsr, Ctrlstack *cstk, Valstack *vstk);
 Object *object_new_box (Object *obref, int stklvl);
 void object_delete_box (Object *box);
 void object_closeiflvl_box (Object *box, int lvlclause);
+
+Object *object_new_tyycls (void);
+void object_delete_tyycls (Object *tc);
+void object_addrule_tyycls (Object *tc, Rule *rule);
+void object_derive_tyycls (Object *tc, Object *deriv);
 
 #endif
