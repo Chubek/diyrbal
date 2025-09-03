@@ -101,6 +101,7 @@ gc_mark (Object *obj)
       continue;
     case VAL_Closure:
       gc_mark (OBJ_AsClosure (obj).env);
+      gc_mark (OBJ_AsClosure (obj).parent);
       gc_mark (OBJ_AsClosure (obj).upvalues);
       continue;
     case VAL_Upvalue:
@@ -220,6 +221,7 @@ gc_update_obj_ref (Object *obj)
       continue;
     case VAL_Closure:
       gc_update_obj_ref (OBJ_AsClosure (obj).env);
+      gc_update_obj_ref (OBJ_AsClosure (obj).parent);
       gc_update_obj_ref (OBJ_AsClosure (obj).upvalues);
       continue;
     case VAL_Upvalue:
