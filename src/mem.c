@@ -30,7 +30,7 @@ heap_destroy (Heap *h)
   xfree (h);
 }
 
-void
+static inline void
 heap_push_root (Heap *h, Object *const newroot)
 {
   if (h->cntroots / h->caproots >= ROOTS_GROWTH_RATIO)
@@ -44,14 +44,15 @@ heap_push_root (Heap *h, Object *const newroot)
 
 void
 heap_push_frame_roots (Heap *h, Stackframe *frm)
-{
-  for (size_t i = 0; i < frm->nlocals; i++)
-    heap_push_root (h, &frm->locptr[i]);
-  for (size_t j = i; j < frm->nlocals + frm->nparams; j++)
-    heap_push_root (h, &frm->locptr[j]);
+{ 
+  size_t i;
+  for (i = 0; i < frm->nlocals; i++)
+    heap_push_root (h, frm->locptr[i]);
+  for (; i < frm->nlocals + frm->nparams; i++)
+    heap_push_root (h, frm->locptr[i]);
 }
 
-void
+static inline void
 heap_pop_root (Heap *h)
 {
   if (h->cntroots == 0)
