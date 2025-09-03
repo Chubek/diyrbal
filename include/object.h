@@ -162,6 +162,7 @@ struct Object
   bool marked;
   Object *next;
   Object *forwarding_addr;
+  Hashfn *hashfunc;
 };
 
 static Object *object_new (ObjType type);
