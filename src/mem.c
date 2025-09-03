@@ -99,12 +99,27 @@ gc_mark (Object *obj)
             }
         }
       continue;
-    case VAL_Closure:
-      gc_mark (OBJ_AsClosure (obj).env);
-      gc_mark (OBJ_AsClosure (obj).parent);
-      for (size_t i = 0; i < OBJ_AsClosure (obj).cntboxes; i++)
-	      gc_mark (OBJ_AsClosure (obj).boxes[i]->objref);
+    case VAL_Class:
+      for (size_t i = 0; i < OBJ_AsClass (obj).cntfields; i++)
+        gc_mark (OBJ_AsClass (obj).fields[i]);
+      for (size_t i = 0; i < OBJ_AsClass (obj).cntmethods; i++)
+        gc_mark (OBJ_AsClass (obj).methods[i]);
+      for (size_t i = 0; i < OBJ_AsClass (obj).cntcnsts; i++)
+        gc_mark (OBJ_AsClass (obj).cnsts[i]);
       continue;
+    case VAL_Closure:
+      for (size_t i = 0; i < OBJ_AsClosure (obj).cntcnsts; i++)
+        gc_mark (OBJ_AsClosure (obj).cnsts[i]);
+      gc_mark (OBJ_AsClosure (obj).boxes);
+      continue;
+    case OBJ_Box:
+      for (Object *o = obj; o; o = o->next)
+        {
+          Box *b = OBJ_AsBox (o);
+          if (b->closed)
+            gc_mark (b->objref);
+        }
+      break;
     default:
       continue;
     }
@@ -174,23 +189,23 @@ gc_update_ref (Object **ref)
     {
       *ref = obj->forwarding_addr;
       obj->forwarding_addr = NULL;
-	      obj->marked = false;
-	    }
-	  else
-	    *ref = NULL;
-	}
+      obj->marked = false;
+    }
+  else
+    *ref = NULL;
+}
 
-	static void
-	gc_update_obj_ref (Object *obj)
-	{
+static void
+gc_update_obj_ref (Object *obj)
+{
 
-	  if (obj->type != OBJ_Value)
-	    continue;
+  if (obj->type != OBJ_Value)
+    continue;
 
-	  switch (OBJ_ValueType (obj))
-	    {
-	    case VAL_List:
-	      for (Object *o = OBJ_AsList (obj).head; o; o = o->next)
+  switch (OBJ_ValueType (obj))
+    {
+    case VAL_List:
+      for (Object *o = OBJ_AsList (obj).head; o; o = o->next)
         gc_update_ref (&o);
       continue;
     case VAL_Array:
@@ -213,17 +228,30 @@ gc_update_ref (Object **ref)
             }
         }
       continue;
-    case VAL_Closure:
-      gc_update_obj_ref (OBJ_AsClosure (obj).env);
-      gc_update_obj_ref (OBJ_AsClosure (obj).parent);
-      for (size_t i = 0; i < OBJ_AsClosure (obj).cntboxes; i++)
-	      gc_update_ref (OBJ_AsClosure (obj).boxes[i]->objref);
+    case VAL_Class:
+      for (size_t i = 0; i < OBJ_AsClass (obj).cntfields; i++)
+        gc_update_ref (&OBJ_AsClass (obj).fields[i]);
+      for (size_t i = 0; i < OBJ_AsClass (obj).cntmethods; i++)
+        gc_update_ref (&OBJ_AsClass (obj).methods[i]);
+      for (size_t i = 0; i < OBJ_AsClass (obj).cntcnsts; i++)
+        gc_update_ref (&OBJ_AsClass (obj).cnsts[i]);
       continue;
+    case VAL_Closure:
+      for (size_t i = 0; i < OBJ_AsClosure (obj).cntcnsts; i++)
+        gc_update_ref (&OBJ_AsClosure (obj).cnsts[i]);
+      gc_update_obj_ref (OBJ_AsClosure (obj).boxes);
+      continue;
+    case VAL_Boxes:
+      for (Object *o = obj; o; o = o->next)
+        {
+          Box *b = OBJ_AsBox (o);
+          if (b->closed)
+            gc_update_ref (&b->objref);
+        }
     default:
       continue;
     }
 }
-
 static void
 gc_update_refs (Heap *h)
 {
