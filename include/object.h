@@ -16,7 +16,8 @@
 #define OBJ_AsTuple(o) (o->as.value->as.tuple)
 #define OBJ_AsString(o) (o->as.value->as.string)
 #define OBJ_AsHash(o) (o->as.value->as.hash)
-#define OBJ_AsTyycls(o) (o->as.value->as.tyycls)
+#define OBJ_AsClass(o) (o->as.value->as.cls)
+#define OBJ_AsPort(o) (o->as.value->as.port)
 #define OBJ_AsClosure(o) (o->as.value->as.closure)
 #define OBJ_AsBox(o) (o->as.value->as.box)
 #define OBJ_AsInteger(o) (o->as.integer)
@@ -78,11 +79,24 @@ struct Value
       size_t cnt, cap;
     } hash;
 
-    struct Tyycls
+    struct Class
     {
-	Rule *rules;
-	size_t cntrules;
-    } tyycls;
+      Object *super;
+      Object *fields;
+      Object *methods;
+      Object *symtbl;
+      Object **cnstbl;
+      size_t cntcnstbl;
+      size_t capcnstbl;
+    } cls;
+
+    struct Port
+    {
+      const char *path;
+      FILE *stream;
+      bool r, w, a, b;
+      bool std;
+    } port;
 
     struct Closure
     {
@@ -204,9 +218,12 @@ Object *object_new_box (Object *obref, int stklvl);
 void object_delete_box (Object *box);
 void object_closeiflvl_box (Object *box, int lvlclause);
 
-Object *object_new_tyycls (void);
-void object_delete_tyycls (Object *tc);
-void object_addrule_tyycls (Object *tc, Rule *rule);
-void object_derive_tyycls (Object *tc, Object *deriv);
+Object *object_new_class (Object *super);
+void object_delete_class (Object *cls);
+void object_fieldfn_class (Object *cls, const Object *name, Object *value);
+void object_methdfn_class (Object *cls, const Object *name, Object *method);
+void object_cnstadd_class (Object *cls, Object *cnst);
+Object *object_getsym_class (Object *cls, const Object *name);
+Object *object_getcsnt_class (Object *cls, size_t offs);
 
 #endif
