@@ -4,8 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "tyydecl.h"
 #include "config.h"
+#include "tyydecl.h"
 
 struct Value
 {
@@ -20,8 +20,6 @@ struct Value
     VAL_Closure,
     VAL_Prog,
     VAL_Upvalue,
-    VAL_Frame,
-    VAL_Opstack,
   } type;
 
   union
@@ -70,15 +68,15 @@ struct Value
 
     struct Closure
     {
-      Hash *env;
-      Prog *code;
-      Upvalue *upvals;
+      Object *env;
+      Object *code;
+      Object *upvals;
     } closure;
 
     struct Upvalue
     {
-      Value *obj;
-      bool open;
+      Object *obj;
+      bool boxed;
     } upvalue;
 
     struct Prog
@@ -86,23 +84,7 @@ struct Value
       Instr *instrs;
       size_t cnt, cap;
       size_t insptr;
-    } chunk;
-
-    struct Frame
-    {
-      size_t sttlnk;
-      size_t dynlnk;
-      size_t frmptr;
-      Object *cnstpool;
-      Frame *prev;
-    } frame;
-
-    struct Opstack
-    {
-      Object **oprs;
-      size_t nslots;
-      size_t stkptr;
-    } opstack;
+    } prog;
   } as;
 };
 
