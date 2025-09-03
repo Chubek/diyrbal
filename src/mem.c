@@ -43,6 +43,15 @@ heap_push_root (Heap *h, Object *const newroot)
 }
 
 void
+heap_push_frame_roots (Heap *h, Stackframe *frm)
+{
+  for (size_t i = 0; i < frm->nlocals; i++)
+    heap_push_root (h, &frm->locptr[i]);
+  for (size_t j = i; j < frm->nlocals + frm->nparams; j++)
+    heap_push_root (h, &frm->locptr[j]);
+}
+
+void
 heap_pop_root (Heap *h)
 {
   if (h->cntroots == 0)
@@ -50,6 +59,13 @@ heap_pop_root (Heap *h)
   h->cntroots--;
 }
 
+void
+heap_pop_frame_roots (Heap *h, Stackframe *frm)
+{
+  size_t n = frm->nlocals + frm->nparams;
+  while (n--)
+    heap_pop_root (h);
+}
 static void
 gc_mark (Object *obj)
 {
@@ -92,7 +108,7 @@ gc_mark (Object *obj)
       gc_mark (OBJ_AsClosure (obj).upvalues);
       continue;
     case VAL_Upvalue:
-      if (!OBJ_AsUpvalue (obj).open)
+      if (OBJ_AsUpvalue (obj).boxed)
         gc_mark (OBJ_AsUpvalue (obj).obj);
       continue;
     case VAL_Frame:
@@ -144,7 +160,7 @@ gc_slide_objects (Heap *h)
   while (scan < h->allocptr)
     {
       Object *obj = (Object *)scan;
-      size_t sz = sizeof (Object);
+      size_t sz = obj->size;
 
       if (obj->marked)
         {
@@ -216,13 +232,6 @@ gc_update_obj_ref (Object *obj)
       continue;
     case VAL_Upvalue:
       gc_update_obj_ref (OBJ_AsUpvalue (obj).obj);
-      continue;
-    case VAL_Frame:
-      gc_update_obj_ref (OBJ_AsFrame (obj).cnstpool);
-      continue;
-    case VAL_Opstack:
-      for (size_t i = 0; i < OBJ_AsOpstack (obj).nslots; i++)
-        gc_update_object_ref (OBJ_AsOpstack.oprs[i]);
       continue;
     default:
       continue;
