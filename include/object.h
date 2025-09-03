@@ -7,9 +7,25 @@
 #include "config.h"
 #include "tyydecl.h"
 
+#define OBJ_ObjType(o) (o->type)
+#define OBJ_ValueType(o) (o->as.value->type)
+#define OBJ_AsList(o) (o->as.value->as.list)
+#define OBJ_AsArray(o) (o->as.value->as.array)
+#define OBJ_AsTuple(o) (o->as.value->as.tuple)
+#define OBJ_AsString(o) (o->as.value->as.string)
+#define OBJ_AsHash(o) (o->as.value->as.hash)
+#define OBJ_AsTable(o) (o->as.value->as.table)
+#define OBJ_AsClosure(o) (o->as.value->as.closure)
+#define OBJ_AsProg(o) (o->as.value->as.prog)
+#define OBJ_AsUpvalue(o) (o->as.value->as.upvalue)
+#define OBJ_AsInteger(o) (o->as.integer)
+#define OBJ_AsReal(o) (o->as.real)
+#define OBJ_AsBoolean(o) (o->as.boolean)
+#define OBJ_AsSymbol(o) (&o->as.symbol[0])
+
 struct Value
 {
-  enum
+  enum ValueType
   {
     VAL_List,
     VAL_Array,
@@ -91,7 +107,7 @@ struct Value
 struct Object
 {
   Metatbl *mtbl;
-  enum
+  enum ObjType
   {
     OBJ_Value,
     OBJ_Integer,
@@ -115,5 +131,7 @@ struct Object
   Object *next;
   Object *forwarding_addr;
 };
+
+Object *object_new ();
 
 #endif
