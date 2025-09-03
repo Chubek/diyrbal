@@ -6,7 +6,10 @@
 #include <stdint.h>
 #include <uchar.h>
 
+#include "astnode.h"
 #include "config.h"
+#include "instr.h"
+#include "symtbl.h"
 #include "tyydecl.h"
 
 #define OBJ_ObjType(o) (o->type)
@@ -36,6 +39,8 @@ struct Value
     VAL_Tuple,
     VAL_String,
     VAL_Hash,
+    VAL_Class,
+    VAL_Port,
     VAL_Closure,
     VAL_Prog,
     VAL_Box,
@@ -84,47 +89,50 @@ struct Value
       Object *super;
       Object *fields;
       Object *methods;
-      Object *symtbl;
-      Object **cnstbl;
-      size_t cntcnstbl;
-      size_t capcnstbl;
+      Object **cnsts;
+      size_t cntmethods, capmethods;
+      size_t cntfields, capfields;
+      size_t cntcnsts, capcnsts;
+
+      Symtbl *env;
     } cls;
 
     struct Port
     {
-      const char *path;
+      Object *path;
       FILE *stream;
       bool r, w, a, b;
-      bool std;
+      int stdfd;
+      size_t offs;
     } port;
 
     struct Closure
     {
-      size_t nformals;
-      bool isvarargs;
-      Object *env;
-      Object *parent;
       Object *cnsts;
       Instr *prog;
-      Object *boxes;
-      size_t cntprog, cntcnsts, cntboxes;
-      size_t capprog, capcnsts, capboxes;
+      size_t cntcnsts, capcnsts;
+      size_t cntprog, capprog;
+
+      Object *parent;
+      size_t nformals;
+      bool isvarargs;
+      Symtbl *env;
       ASTNode *srcnode;
+      Object *boxchain;
     } closure;
 
     struct Box
     {
       Object *objref;
-      Object safekeep;
-      int stklvl;
+      int nestlvl;
       bool closed;
+      Object *next;
     } box;
   } as;
 };
 
 struct Object
 {
-  Metatbl *mtbl;
   enum ObjType
   {
     OBJ_Value,
@@ -214,9 +222,9 @@ void object_addconst_closure (Closure *clsr, Object *cnst);
 void object_addinstr_closure (Closure *clsr, Instr *instr);
 void object_execute_closure (Closure *clsr, Ctrlstack *cstk, Valstack *vstk);
 
-Object *object_new_box (Object *obref, int stklvl);
+Object *object_new_box (Object *obref, int nestlvl);
 void object_delete_box (Object *box);
-void object_closeiflvl_box (Object *box, int lvlclause);
+void object_closeiflvl_box (Object *box, int lvlcond);
 
 Object *object_new_class (Object *super);
 void object_delete_class (Object *cls);
@@ -225,5 +233,23 @@ void object_methdfn_class (Object *cls, const Object *name, Object *method);
 void object_cnstadd_class (Object *cls, Object *cnst);
 Object *object_getsym_class (Object *cls, const Object *name);
 Object *object_getcsnt_class (Object *cls, size_t offs);
+
+Object *object_new_port (Object *path, bool r, bool w, bool a, bool b,
+                         int stdfd);
+void object_delete_port (Object *port);
+void object_openstrm_port (Object *port);
+void object_closestrm_port (Object *port);
+Object *object_readline_port (Object *port);
+Object *object_readchar_port (Object *port);
+Object *object_readall_port (Object *port);
+Object **object_readnlines_port (Object *port, Object *n);
+Object **object_readnchars_port (Object *port, Object *n);
+void object_writeline_port (Object *port, Object *ln);
+void object_writechar_port (Object *port, Object *chr);
+void object_writeall_port (Object *port, Object *txt);
+void object_writenlines_port (Object *port, Object **lns, size_t n);
+void object_writenchars_port (Object *port, Object **chrs, size_t n);
+void object_setseek_port (Object *port, Object *nseek, int rel);
+Object *object_getseek_port (Object *port);
 
 #endif
