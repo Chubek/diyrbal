@@ -1,8 +1,10 @@
 #ifndef VALECT_H
 #define VALECT_H
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <uchar.h>
 
 #include "config.h"
 #include "tyydecl.h"
@@ -14,14 +16,14 @@
 #define OBJ_AsTuple(o) (o->as.value->as.tuple)
 #define OBJ_AsString(o) (o->as.value->as.string)
 #define OBJ_AsHash(o) (o->as.value->as.hash)
-#define OBJ_AsTable(o) (o->as.value->as.table)
 #define OBJ_AsClosure(o) (o->as.value->as.closure)
-#define OBJ_AsProg(o) (o->as.value->as.prog)
-#define OBJ_AsUpvalue(o) (o->as.value->as.upvalue)
+#define OBJ_AsBox(o) (o->as.value->as.box)
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
 #define OBJ_AsBoolean(o) (o->as.boolean)
 #define OBJ_AsSymbol(o) (&o->as.symbol[0])
+#define OBJ_AsRange(o) (o->as.range)
+#define OBJ_AsChar(o) (o->as.chr)
 
 struct Value
 {
@@ -32,10 +34,9 @@ struct Value
     VAL_Tuple,
     VAL_String,
     VAL_Hash,
-    VAL_Table,
     VAL_Closure,
     VAL_Prog,
-    VAL_Upvalue,
+    VAL_Box,
   } type;
 
   union
@@ -47,19 +48,19 @@ struct Value
 
     struct Array
     {
-      Value **data;
+      Object **data;
       size_t cnt, cap;
     } array;
 
     struct Tuple
     {
-      Value **data;
+      Object **data;
       size_t cnt;
     } tuple;
 
     struct String
     {
-      const uint8_t *buff;
+      const char32_t *buff;
       size_t len, cap;
       bool utf8;
     } string;
@@ -68,7 +69,7 @@ struct Value
     {
       struct Entry
       {
-        Object *key;
+        const Object *key;
         Object *value;
         Entry *next;
       } *entries;
@@ -76,31 +77,27 @@ struct Value
       size_t cnt, cap;
     } hash;
 
-    struct Table
-    {
-      Object *array_part;
-      Object *hash_part;
-    } table;
-
     struct Closure
     {
+      size_t nformals;
+      bool isvarargs;
       Object *env;
-      Object *code;
-      Object *upvals;
+      Object *parent;
+      Object *consts;
+      Instr *prog;
+      Object *boxes;
+      size_t cntprog, cntconsts, cntboxes;
+      size_t capprog, capconsts, capboxes;
+      ASTNode *srcnode;
     } closure;
 
-    struct Upvalue
+    struct Box
     {
-      Object *obj;
-      bool boxed;
-    } upvalue;
-
-    struct Prog
-    {
-      Instr *instrs;
-      size_t cnt, cap;
-      size_t insptr;
-    } prog;
+      Object *objref;
+      Object safekeep;
+      int stklvl;
+      bool closed;
+    } box;
   } as;
 };
 
@@ -113,7 +110,9 @@ struct Object
     OBJ_Integer,
     OBJ_Real,
     OBJ_Boolean,
+    OBJ_Char,
     OBJ_Symbol,
+    OBJ_Range,
     OBJ_Nil,
   } type;
 
@@ -123,7 +122,14 @@ struct Object
     intmax_t integer;
     double real;
     bool boolean;
+    char32_t chr;
     const char symbol[SYM_SIZE + 1];
+    struct Range
+    {
+      uint64_t start : 31;
+      uint64_t end : 31;
+      uint64_t step : 2;
+    } range;
   } as;
 
   size_t size;
@@ -132,6 +138,63 @@ struct Object
   Object *forwarding_addr;
 };
 
-Object *object_new ();
+static Object *object_new (ObjType type);
+static void object_delete (Object *obj);
+static Object *object_new_value (ValueType type);
+static void object_delete_value (Object *obj);
+
+Object *object_new_integer (intmax_t ival);
+Object *object_new_real (double rval);
+Object *object_new_boolean (bool bval);
+Object *object_new_symbol (const char sval);
+Object *object_new_range (int start, int end, int step);
+Object *object_new_char (char32_t chrval);
+
+Object *object_new_list (void);
+void object_delete_list (Object *lst);
+void object_appenditem_list (Object *lst, Object *newobj);
+void object_deleteitem_list (Object *lst, Object *delobj);
+Object *object_getrange_list (Object *lst, Object *range);
+Object *object_setrange_list (Object *lst, Object *newrng, Object *range);
+
+Object *object_new_array (size_t cap);
+void object_delete_array (Object *arr);
+Object *object_getrange_array (Object *arr, Object *range);
+void object_setrange_array (Object *arr, Object *newrng, Object *range);
+
+Object *object_new_tuple (size_t cnt, ...);
+void object_delete_tuple (Object *tup);
+Object *object_getrange_array (Object *tup, Object *range);
+void object_setrange_array (Object *tup, Object *newrng, Object *range);
+
+Object *object_new_string (const char32_t *from, size_t nfrom);
+void object_delete_string (Object *str);
+Object *object_appendchar_string (Object *str, Object *chr);
+Object *object_catstr_string (Object *str1, Object *str2);
+Object *object_getrange_string (Object *str, Object *range);
+void object_setrange_string (Object *str, Object *newrng, Object *range);
+Object *object_getlen_string (Object *str);
+Object *object_matchpatt_string (Object *str, Object *patt);
+
+Object *object_new_hash (size_t cap);
+void object_delete_hash (Object *hash);
+void object_setitem_hash (Object *hash, const Object *key, Object *value);
+bool object_getitem_hash (Object *hash, const Object *key, Object **valdst);
+bool object_delitem_hash (Object *hash, const Object *key);
+static bool object_shoudgrow_hash (Object *hash);
+static void object_grow_hash (Object *hash);
+
+Object *object_new_closure (Object *parent, size_t nformals, bool isvarargs);
+void object_delete_closure (Object *clsr);
+void object_setenv_closure (Object *clsr, const Object *symbol, Object *value);
+Object *object_getenv_closure (Object *clsr, const Object *symbol);
+void object_addbox_closure (Closure *clsr, Object *box);
+void object_addconst_closure (Closure *clsr, Object *cnst);
+void object_addinstr_closure (Closure *clsr, Instr *instr);
+void object_execute_closure (Closure *clsr, Ctrlstack *cstk, Valstack *vstk);
+
+Object *object_new_box (Object *obref, int stklvl);
+void object_delete_box (Object *box);
+void object_closeiflvl_box (Object *box, int lvlclause);
 
 #endif
