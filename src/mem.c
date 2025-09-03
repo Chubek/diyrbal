@@ -106,14 +106,7 @@ gc_mark (Object *obj)
       continue;
     case VAL_Upvalue:
       if (OBJ_AsUpvalue (obj).boxed)
-        gc_mark (OBJ_AsUpvalue (obj).obj);
-      continue;
-    case VAL_Frame:
-      gc_mark (OBJ_AsFrame (obj).cnstpool);
-      continue;
-    case VAL_Opstack:
-      for (size_t i = 0; i < OBJ_AsOpstack (obj).nslots; i++)
-        gc_mark (OBJ_AsOpstack (obj).oprs[i]);
+        gc_mark (OBJ_AsUpvalue (obj).objref);
       continue;
     default:
       continue;
@@ -180,8 +173,12 @@ gc_update_ref (Object **ref)
     return;
 
   Object *obj = *ref;
-  if (obj->marked && obj->type == OBJ_Value)
-    *ref = obj->forwarding_addr;
+  if (obj->marked && obj->type == OBJ_Value && obj->forwarding_addr)
+    {
+      *ref = obj->forwarding_addr;
+      obj->forwarding_addr = NULL;
+      obj->marked = false;
+    }
   else
     *ref = NULL;
 }
