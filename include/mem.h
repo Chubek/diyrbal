@@ -21,7 +21,9 @@ struct Heap
 Heap *heap_new (size_t szheap, size_t nroots);
 void heap_destroy (Heap *h);
 void heap_push_root (Heap *h, Object *const newroot);
+void heap_push_frame_roots (Heap *h, Stackframe *frm);
 void heap_pop_root (Heap *h);
+void heap_pop_frame_roots (Heap *h, Stackframe *frm);
 static void gc_mark (Object *obj);
 static void gc_mark_all (Heap *h);
 static void gc_compute_forwarding_addr (Heap *h);
