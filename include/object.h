@@ -104,11 +104,11 @@ struct Value
       bool isvarargs;
       Object *env;
       Object *parent;
-      Object *consts;
+      Object *cnsts;
       Instr *prog;
       Object *boxes;
-      size_t cntprog, cntconsts, cntboxes;
-      size_t capprog, capconsts, capboxes;
+      size_t cntprog, cntcnsts, cntboxes;
+      size_t capprog, capcnsts, capboxes;
       ASTNode *srcnode;
     } closure;
 
