@@ -99,10 +99,6 @@ gc_mark (Object *obj)
             }
         }
       continue;
-    case VAL_Table:
-      gc_mark (OBJ_AsTable (obj).hash_part);
-      gc_mark (OBJ_AsTable (obj).array_part);
-      continue;
     case VAL_Closure:
       gc_mark (OBJ_AsClosure (obj).env);
       gc_mark (OBJ_AsClosure (obj).upvalues);
@@ -221,10 +217,6 @@ gc_update_obj_ref (Object *obj)
               e = e->next;
             }
         }
-      continue;
-    case VAL_Table:
-      gc_update_obj_ref (OBJ_AsTable (obj).hash_part);
-      gc_update_obj_ref (OBJ_AsTable (obj).array_part);
       continue;
     case VAL_Closure:
       gc_update_obj_ref (OBJ_AsClosure (obj).env);
