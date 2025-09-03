@@ -217,7 +217,7 @@ Object *object_getenv_closure (Object *clsr, const Object *symbol);
 void object_addbox_closure (Closure *clsr, Object *box);
 void object_addconst_closure (Closure *clsr, Object *cnst);
 void object_addinstr_closure (Closure *clsr, Instr *instr);
-void object_execute_closure (Closure *clsr, Ctrlstack *cstk, Valstack *vstk);
+void object_execute_closure (Closure *clsr, Interp *interp);
 
 Object *object_new_box (Object *obref, int nestlvl);
 void object_delete_box (Object *box);
