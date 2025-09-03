@@ -102,11 +102,8 @@ gc_mark (Object *obj)
     case VAL_Closure:
       gc_mark (OBJ_AsClosure (obj).env);
       gc_mark (OBJ_AsClosure (obj).parent);
-      gc_mark (OBJ_AsClosure (obj).upvalues);
-      continue;
-    case VAL_Upvalue:
-      if (OBJ_AsUpvalue (obj).boxed)
-        gc_mark (OBJ_AsUpvalue (obj).objref);
+      for (size_t i = 0; i < OBJ_AsClosure (obj).cntboxes; i++)
+	      gc_mark (OBJ_AsClosure (obj).boxes[i]->objref);
       continue;
     default:
       continue;
@@ -177,23 +174,23 @@ gc_update_ref (Object **ref)
     {
       *ref = obj->forwarding_addr;
       obj->forwarding_addr = NULL;
-      obj->marked = false;
-    }
-  else
-    *ref = NULL;
-}
+	      obj->marked = false;
+	    }
+	  else
+	    *ref = NULL;
+	}
 
-static void
-gc_update_obj_ref (Object *obj)
-{
+	static void
+	gc_update_obj_ref (Object *obj)
+	{
 
-  if (obj->type != OBJ_Value)
-    continue;
+	  if (obj->type != OBJ_Value)
+	    continue;
 
-  switch (OBJ_ValueType (obj))
-    {
-    case VAL_List:
-      for (Object *o = OBJ_AsList (obj).head; o; o = o->next)
+	  switch (OBJ_ValueType (obj))
+	    {
+	    case VAL_List:
+	      for (Object *o = OBJ_AsList (obj).head; o; o = o->next)
         gc_update_ref (&o);
       continue;
     case VAL_Array:
@@ -219,10 +216,8 @@ gc_update_obj_ref (Object *obj)
     case VAL_Closure:
       gc_update_obj_ref (OBJ_AsClosure (obj).env);
       gc_update_obj_ref (OBJ_AsClosure (obj).parent);
-      gc_update_obj_ref (OBJ_AsClosure (obj).upvalues);
-      continue;
-    case VAL_Upvalue:
-      gc_update_obj_ref (OBJ_AsUpvalue (obj).obj);
+      for (size_t i = 0; i < OBJ_AsClosure (obj).cntboxes; i++)
+	      gc_update_ref (OBJ_AsClosure (obj).boxes[i]->objref);
       continue;
     default:
       continue;
