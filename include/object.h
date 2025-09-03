@@ -6,10 +6,7 @@
 #include <stdint.h>
 #include <uchar.h>
 
-#include "astnode.h"
 #include "config.h"
-#include "instr.h"
-#include "symtbl.h"
 #include "tyydecl.h"
 
 #define OBJ_ObjType(o) (o->type)
