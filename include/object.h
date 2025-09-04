@@ -32,6 +32,7 @@
 #define OBJ_AsSymbol(o) (&o->as.symbol[0])
 #define OBJ_AsRange(o) (o->as.range)
 #define OBJ_AsChar(o) (o->as.chr)
+#define OBJ_AsCfunc(o) (o->as.cfunc)
 
 struct Value
 {
@@ -243,6 +244,7 @@ struct Object
       uint64_t end : 31;
       uint64_t step : 2;
     } range;
+    CFunc *cfunc;
   } as;
 
   size_t size;
@@ -263,6 +265,7 @@ Object *object_new_boolean (bool bval);
 Object *object_new_symbol (const char *sval);
 Object *object_new_range (int start, int end, int step);
 Object *object_new_char (char32_t chrval);
+Object *object_new_cfunc (CFunc *cfnval);
 
 Object *object_new_list (void);
 void object_delete_list (Object *lst);
@@ -317,7 +320,8 @@ Object *object_getenv_closure (Object *clsr, const Object *symbol);
 void object_addbox_closure (Closure *clsr, Object *box);
 void object_addconst_closure (Closure *clsr, Object *cnst);
 void object_addinstr_closure (Closure *clsr, Instr *instr);
-void object_execute_closure (Closure *clsr, Interp *interp);
+void object_execute_closure (Closure *clsr, DiyInterp *interp);
+
 
 Object *object_new_box (Object *obref, int nestlvl);
 void object_delete_box (Object *box);
