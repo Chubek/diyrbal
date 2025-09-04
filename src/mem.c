@@ -165,6 +165,9 @@ gc_mark (Object *obj)
       gc_mark (OBJ_AsTree (obj).nodes);
       gc_mark (OBJ_AsTree (obj).incdmat);
       continue;
+    case VAL_Coroutine:
+      gc_mark (OBJ_AsCoroutine (obj).fn);
+      continue;
     case VAL_Emitter:
       // TODO
     default:
@@ -341,6 +344,9 @@ gc_update_obj_ref (Object *obj)
     case VAL_Graph:
       gc_update_obj_ref (OBJ_AsTree (obj).nodes);
       gc_update_obj_ref (OBJ_AsTree (obj).incdmat);
+      continue;
+    case VAL_Coroutine:
+      gc_update_object_ref (OBJ_AsCoroutine (obj).fn);
       continue;
     case VAL_Emitter:
       // TODO
