@@ -1,6 +1,7 @@
 #ifndef OBJECT_H
 #define OBJECT_H
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,6 +21,8 @@
 #define OBJ_AsPort(o) (o->as.value->as.port)
 #define OBJ_AsClosure(o) (o->as.value->as.closure)
 #define OBJ_AsBox(o) (o->as.value->as.box)
+#define OBJ_AsPattern(o) (o->as.value->as.pattern)
+#define OBJ_AsMatchResult(o) (o->as.value->as.matchresult)
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
 #define OBJ_AsBoolean(o) (o->as.boolean)
@@ -125,6 +128,51 @@ struct Value
       bool closed;
       Object *next;
     } box;
+
+    struct Pattern
+    {
+      struct PatternElt
+      {
+
+        enum PatternType
+        {
+          PATT_Literal,
+          PATT_Class,
+          PATT_AnchorStart,
+          PATT_AnchorEnd,
+          PATT_CaptureStart,
+          PATT_CaptureEnd,
+          PATT_AnyChar,
+          PATT_Frontier,
+        } type;
+
+        enum PatternQuantifier
+        {
+          PQUANT_Once,
+          PQUANT_ZeroOrMore,
+          PQUANT_OnceOrMore,
+          PQUANT_ZeroOrOne,
+        } quantifier;
+
+        bool nongreedy;
+        bool inverted;
+        uint8_t literal;
+        uint8_t clsname;
+        uint8_t bitmap[UCHAR_MAX + 1];
+      } *elts;
+      size_t cntelts, capelts;
+      Object *srcstr;
+    } pattern;
+
+    struct MatchResult
+    {
+      Object *captrngs;
+      size_t cntcaptrngs;
+      Object *matchrngs;
+      size_t cntmatchrngs;
+      bool success;
+      Object *matchstr;
+    } matchresult;
   } as;
 };
 
@@ -202,6 +250,7 @@ Object *object_getrange_string (Object *str, Object *range);
 void object_setrange_string (Object *str, Object *newrng, Object *range);
 Object *object_getlen_string (Object *str);
 Object *object_matchpatt_string (Object *str, Object *patt);
+Object *object_findpatt_string (Object *str, Object *patt);
 
 Object *object_new_hash (size_t cap);
 void object_delete_hash (Object *hash);
@@ -249,5 +298,19 @@ void object_writenlines_port (Object *port, Object **lns, size_t n);
 void object_writenchars_port (Object *port, Object **chrs, size_t n);
 void object_setseek_port (Object *port, Object *nseek, int rel);
 Object *object_getseek_port (Object *port);
+
+Object *object_new_pattern (Object *srcstr);
+void object_delete_pattern (Object *patt);
+void object_addelt_pattern (Object *patt, PatternType type,
+                            PatternQuantifier quant, bool nongreedy,
+                            bool inverted, uint8_t literal, uint8_t clsname,
+                            uint8_t *bitmap);
+Object *object_runmatch_pattern (Object *patt, Object *matchstr);
+
+Object *object_new_matchresult (Object *matchstr);
+void object_delete_matchresult (Object *mres);
+void object_addcaptrng_matchresult (Object *mres, Object *crng);
+void object_addmatchrng_matchresult (Object *mres, Object *mrng);
+void object_setsuccess_matchresult (Object *mres, bool succres);
 
 #endif
