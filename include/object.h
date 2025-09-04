@@ -277,38 +277,55 @@ Object *object_new_integer (intmax_t ival);
 Object *object_new_real (double rval);
 Object *object_new_boolean (bool bval);
 Object *object_new_symbol (const char *sval);
-Object *object_new_range (int start, int end, int step);
 Object *object_new_char (char32_t chrval);
 Object *object_new_cfunc (CFunc *cfnval);
 Object *object_new_nil (void);
 
+
+Object *object_new_range (int start, int end, int step);
+
+
 /* set #3 */
 Object *object_new_list (void);
-void object_appenditem_list (Object *lst, Object *newobj);
-void object_deleteitem_list (Object *lst, Object *delobj);
+void object_append_list (Object *lst, Object *newobj);
+void object_delete_list (Object *lst, Object *delobj);
+Object *object_idxof_list (Object *lst, Object *item);
+Object *object_shift_list (Object *lst);
+Object *object_pop_list (Object *lst);
+Object *object_getat_list (Object *lst, Object *idx);
+void object_setat_list (Object *lst, Object *newitem, Object *idx);
 Object *object_getrange_list (Object *lst, Object *rng);
 void object_setrange_list (Object *lst, Object *slice, Object *rng);
 
 /* set #4 */
 Object *object_new_array (size_t cap);
+void object_insert_array (Object *arr, Object *item);
+Object *object_getat_array (Object *arr, Object *item);
+void object_setat_array (Object *arr, Object *newitem, Object *idx);
 Object *object_getrange_array (Object *arr, Object *range);
 void object_setrange_array (Object *arr, Object *slice, Object *rng);
 
 /* set #5 */
 Object *object_new_tuple (size_t cnt, ...);
-Object *object_getrange_array (Object *tup, Object *range);
-void object_setrange_array (Object *tup, Object *slice, Object *rng);
+Object *object_getat_tuple (Object *tup, Object *idx);
+Object *object_getrange_tuple (Object *tup, Object *range);
 
 /* set #6 */
 Object *object_new_set (size_t cap);
-Object *object_insert_set (Object *set, Object *item);
+void object_freeze_set (Object *set);
+Object *object_add_set (Object *set, Object *item);
+Object *object_remove_set (Object *set, Object *item);
+Object *object_removeat_set (Object *set, Object *idx);
 Object *object_union_set (Object *set1, Object *set2);
 Object *object_intersect_set (Object *set1, Object *set2);
 Object *object_differ_set (Object *set1, Object *set2);
-void object_setidx_set (Object *set, Object *idx, Object *item);
-Object *object_getidx_set (Object *set, Object *idx);
+Object *object_symdiffer_set (Object *set1, Object *set2);
+Object *object_getat_set (Object *set, Object *idx);
+void object_setat_set (Object *set, Object *idx, Object *item);
 Object *object_getrng_set (Object *set, Object *rng);
 void object_setrng_set (Object *set, Object *slice, Object *rng);
+Object *object_issubset_set (Object *set, Object *sub);
+Object *object_issuperset_set (Object *set, Object *sup);
 
 /* set #7 */
 Object *object_new_string (const char32_t *from, size_t nfrom);
