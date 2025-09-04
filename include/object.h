@@ -32,6 +32,7 @@
 #define OBJ_AsGraph(o) (o->as.value->as.graph)
 #define OBJ_AsTree(o) (o->as.value->as.tree)
 #define OBJ_AsEmitter(o) (o->as.value->as.emitter)
+#define OBJ_AsPolyhedron(o) (o->as.value->as.polyhedron)
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
 #define OBJ_AsBoolean(o) (o->as.boolean)
@@ -63,6 +64,7 @@ struct Value
     VAL_DSL,
     VAL_Tree,
     VAL_Graph,
+    VAL_Polyhedron,
     VAL_Emitter,
   } type;
 
@@ -283,6 +285,14 @@ struct Value
       Object *incdmat;
     } graph;
 
+    struct Polyhedron
+    {
+      Object *dims;
+      Object *coeffmats;
+      Object *cnstterms;
+      Object *ineqs;
+    } polyhedron;
+
     struct Emitter
     {
       // TODO
@@ -498,5 +508,7 @@ void object_connode_graph (Object *grph, Object *from, Object *to);
 /* set #21 */
 Object *object_new_coroutine (Object *fn, Context *ctx, int id);
 
+/* set #22 */
+Object *object_new_polyhedron (Object *dims);
 
 #endif
