@@ -79,6 +79,7 @@ struct Value
     {
       Object **membs;
       size_t cnt, cap;
+      bool frozen;
     } set;
 
     struct String
@@ -277,13 +278,10 @@ Object *object_new_integer (intmax_t ival);
 Object *object_new_real (double rval);
 Object *object_new_boolean (bool bval);
 Object *object_new_symbol (const char *sval);
+Object *object_new_range (int start, int end, int step);
 Object *object_new_char (char32_t chrval);
 Object *object_new_cfunc (CFunc *cfnval);
 Object *object_new_nil (void);
-
-
-Object *object_new_range (int start, int end, int step);
-
 
 /* set #3 */
 Object *object_new_list (void);
