@@ -201,12 +201,12 @@ struct Value
       {
         enum ParseAction
         {
-          PTABLE_Predict,
-          PTABLE_Error,
+          PACTION_Predict,
+          PACTION_Error,
         } type;
         size_t predidx;
       } *entries;
-      size_t nentires, capentries;
+      size_t cntentires, capentries;
       Object *eps;
       Object *firsts;
       Object *follows;
@@ -320,8 +320,7 @@ Object *object_getenv_closure (Object *clsr, const Object *symbol);
 void object_addbox_closure (Closure *clsr, Object *box);
 void object_addconst_closure (Closure *clsr, Object *cnst);
 void object_addinstr_closure (Closure *clsr, Instr *instr);
-void object_execute_closure (Closure *clsr, DiyInterp *interp);
-
+void object_execute_closure (Closure *clsr, Interp *interp);
 
 Object *object_new_box (Object *obref, int nestlvl);
 void object_delete_box (Object *box);
