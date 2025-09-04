@@ -1,6 +1,7 @@
 #ifndef OBJECT_H
 #define OBJECT_H
 
+#include <complex.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -17,6 +18,7 @@
 #define OBJ_AsTuple(o) (o->as.value->as.tuple)
 #define OBJ_AsSet(o) (o->as.value->as.set)
 #define OBJ_AsBignum(o) (o->as.value->as.bignum)
+#define OBJ_AsRational(o) (o->as.value->as.rational)
 #define OBJ_AsString(o) (o->as.value->as.string)
 #define OBJ_AsHash(o) (o->as.value->as.hash)
 #define OBJ_AsClass(o) (o->as.value->as.cls)
@@ -37,6 +39,7 @@
 #define OBJ_AsILattice(o) (o->as.value->as.ilattice)
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
+#define OBJ_AsComplex(o) (o->as.complx)
 #define OBJ_AsBoolean(o) (o->as.boolean)
 #define OBJ_AsSymbol(o) (o->as.symbol)
 #define OBJ_AsRange(o) (o->as.range)
@@ -52,6 +55,7 @@ struct Value
     VAL_Tuple,
     VAL_Set,
     VAL_Bignum,
+    VAL_Rational,
     VAL_String,
     VAL_Hash,
     VAL_Class,
@@ -116,6 +120,13 @@ struct Value
       Object *frombase;
       Object *src;
     } bignum;
+
+    struct Rational
+    {
+      Object *num;
+      Object *denum;
+      Object *src;
+    } rational;
 
     struct String
     {
@@ -337,6 +348,7 @@ struct Object
     OBJ_Value,
     OBJ_Integer,
     OBJ_Real,
+    OBJ_Complex,
     OBJ_Boolean,
     OBJ_Char,
     OBJ_Symbol,
@@ -350,6 +362,7 @@ struct Object
     Value *value;
     intmax_t integer;
     double real;
+    double complex complx;
     bool boolean;
     char32_t chr;
     uint32_t symbol;
@@ -376,6 +389,7 @@ static Object *object_new_value (ValueType type);
 /* set #2 */
 Object *object_new_integer (intmax_t ival);
 Object *object_new_real (double rval);
+Object *object_new_complex (double complex cxval);
 Object *object_new_boolean (bool bval);
 Object *object_new_symbol (const char *sval);
 Object *object_new_range (int start, int end, int step);
@@ -547,17 +561,28 @@ Object *object_new_ilattice (Object *dim, Object *rank, Object *basis,
 
 /* set #24 */
 Object *object_new_bignum (void);
-Object *object_fromstr_bignum (Object *nsrc, Object *frombase);
-Object *object_add_bignum (Object *bn1, Object *bn2);
-Object *object_sub_bignum (Object *bn1, Object *bn2);
-Object *object_mul_bignum (Object *bn1, Object *bn2);
-Object *object_idiv_bignum (Object *bn1, Object *bn2);
-Object *object_fdiv_bignum (Object *bn1, Object *bn2);
-Object *object_mod_bignum (Object *bn1, Object *bn2);
-Object *object_shr_bignum (Object *bn1, Object *bn2);
-Object *object_shl_bignum (Object *bn1, Object *bn2);
-Object *object_bitand_bignum (Object *bn1, Object *bn2);
-Object *object_bitor_bignum (Object *bn1, Object *bn2);
-Object *object_bitxor_bignum (Object *bn1, Object *bn2);
+Object *object_fromstr_bignum (object *nsrc, object *frombase);
+Object *object_add_bignum (object *bn1, object *bn2);
+Object *object_sub_bignum (object *bn1, object *bn2);
+Object *object_mul_bignum (object *bn1, object *bn2);
+Object *object_pow_bignum (object *bn1, object *bn2);
+Object *object_idiv_bignum (object *bn1, object *bn2);
+Object *object_fdiv_bignum (object *bn1, object *bn2);
+Object *object_mod_bignum (object *bn1, object *bn2);
+Object *object_shr_bignum (object *bn1, object *bn2);
+Object *object_shl_bignum (object *bn1, object *bn2);
+Object *object_bitand_bignum (object *bn1, object *bn2);
+Object *object_bitor_bignum (object *bn1, object *bn2);
+Object *object_bitxor_bignum (object *bn1, object *bn2);
+
+/* set #25 */
+Object *object_new_rational (void);
+Object *object_fromstr_rational (object *nsrc);
+Object *object_add_rational (object *bn1, object *bn2);
+Object *object_sub_rational (object *bn1, object *bn2);
+Object *object_mul_rational (object *bn1, object *bn2);
+Object *object_pow_rational (object *bn1, object *bn2);
+Object *object_div_rational (object *bn1, object *bn2);
+
 
 #endif
