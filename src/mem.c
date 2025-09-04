@@ -144,6 +144,29 @@ gc_mark (Object *obj)
       gc_mark (OBJ_AsParser (obj).follows);
       gc_mark (OBJ_AsParser (obj).predicts);
       continue;
+    case VAL_DSL:
+      gc_mark (OBJ_AsDSL (obj).grammar);
+      gc_mark (OBJ_AsDSL (obj).absyn);
+      gc_mark (OBJ_AsDSL (obj).emitter);
+      for (size_t i = 0; i < OBJ_AsDSL (obj).cnttriplets; i++)
+        {
+          Triple *trp = &OBJ_AsDSL (obj).triplets[i];
+          gc_mark (trp->precond);
+          gc_mark (trp->stmt);
+          gc_mark (trp->postcond);
+        }
+      continue;
+    case VAL_Tree:
+      gc_mark (OBJ_AsTree (obj).data);
+      gc_mark (OBJ_AsTree (obj).children);
+      gc_mark (OBJ_AsTree (obj).next);
+      continue;
+    case VAL_Graph:
+      gc_mark (OBJ_AsTree (obj).nodes);
+      gc_mark (OBJ_AsTree (obj).incdmat);
+      continue;
+    case VAL_Emitter:
+      // TODO
     default:
       continue;
     }
@@ -295,6 +318,32 @@ gc_update_obj_ref (Object *obj)
       gc_update_obj_ref (OBJ_AsParser (obj).follows);
       gc_update_obj_ref (OBJ_AsParser (obj).predicts;);
       continue;
+    case VAL_DSL:
+      gc_update_obj_ref (OBJ_AsDSL (obj).grammar);
+      gc_update_obj_ref (OBJ_AsDSL (obj).absyn);
+      gc_update_obj_ref (OBJ_AsDSL (obj).emitter);
+      for (size_t i = 0; i < OBJ_AsDSL (obj).cnttriplets; i++)
+        {
+          Triple *trp = &OBJ_AsDSL (obj).triplets[i];
+          gc_update_ref (trp->precond);
+          gc_update_ref (trp->stmt);
+          gc_update_ref (trp->postcond);
+          // NOTE: I have not yet decided the internal representation
+          // for the triplet members. Therefore, these calls might be
+          // changed to `gc_update_obj_ref` later.
+        }
+      continue;
+    case VAL_Tree:
+      gc_update_obj_ref (OBJ_AsTree (obj).data);
+      gc_update_obj_ref (OBJ_AsTree (obj).children);
+      gc_update_obj_ref (OBJ_AsTree (obj).next);
+      continue;
+    case VAL_Graph:
+      gc_update_obj_ref (OBJ_AsTree (obj).nodes);
+      gc_update_obj_ref (OBJ_AsTree (obj).incdmat);
+      continue;
+    case VAL_Emitter:
+      // TODO
     default:
       gc_update_ref (&obj);
       continue;
