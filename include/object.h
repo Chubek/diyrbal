@@ -343,6 +343,7 @@ struct Value
 
 struct Object
 {
+  Metatbl *mtbl;
   enum ObjType
   {
     OBJ_Value,
@@ -353,7 +354,6 @@ struct Object
     OBJ_Char,
     OBJ_Symbol,
     OBJ_Range,
-    OBJ_Nil,
     OBJ_CFunc,
   } type;
 
@@ -379,12 +379,13 @@ struct Object
   bool marked;
   Object *next;
   Object *forwarding_addr;
+  bool nullable;
   Hashfn *hashfunc;
 };
 
 /* set #1 */
-static Object *object_new (ObjType type);
-static Object *object_new_value (ValueType type);
+static Object *object_new (ObjType type, Metatbl *mtbl, bool nullable);
+static Object *object_new_value (ValueType type, Metatbl *mtbl, bool nullable);
 
 /* set #2 */
 Object *object_new_integer (intmax_t ival);
@@ -395,7 +396,6 @@ Object *object_new_symbol (const char *sval);
 Object *object_new_range (int start, int end, int step);
 Object *object_new_char (char32_t chrval);
 Object *object_new_cfunc (CFunc *cfnval);
-Object *object_new_nil (void);
 
 /* set #3 */
 Object *object_new_list (void);
@@ -409,10 +409,17 @@ Object *object_getat_list (Object *lst, Object *idx);
 void object_setat_list (Object *lst, Object *newitem, Object *idx);
 Object *object_getrange_list (Object *lst, Object *rng);
 void object_setrange_list (Object *lst, Object *slice, Object *rng);
+void object_catlist_list (Object *lst, Object *catlst);
+void object_apply_list (Object *lst, Object *applyfn);
+Object *object_map_list (Object *lst, Object *mapfn);
+Object *object_filter_list (Object *lst, Object *predfn);
+Object *object_fold_list (Object *lst, Object *foldfn, Object *initlst);
+void object_sort_list (Object *lst, Object *predfn);
 
 /* set #4 */
 Object *object_new_array (size_t cap, Object *dims);
 void object_insert_array (Object *arr, Object *item, Object *dim);
+Object *object_concat_array (Object *arr1, Object *arr2);
 Object *object_idxof_array (Object *arr, Object *item);
 Object *object_getat_array (Object *arr, Object *idx, Object *dim);
 void object_setat_array (Object *arr, Object *newitem, Object *idx,
@@ -420,11 +427,28 @@ void object_setat_array (Object *arr, Object *newitem, Object *idx,
 Object *object_getrange_array (Object *arr, Object *range, Object *dim);
 void object_setrange_array (Object *arr, Object *slice, Object *rng,
                             Object *dim);
+Object *object_matmul_array (Object *arr1, Object *arr2);
+Object *object_eltmul_array (Object *arr1, Object *arr2);
+Object *object_eltsub_array (Object *arr1, Object *arr2);
+void object_apply_array (Object *arr, Object *applyfn);
+Object *object_map_array (Object *arr, Object *mapfn);
+Object *object_filter_array (Object *arr, Object *predfn);
+Object *object_fold_array (Object *arr, Object *foldfn, Object *initarr);
+void object_sort_array (Object *arr, Object *predfn);
 
 /* set #5 */
 Object *object_new_tuple (size_t cnt, ...);
+Object *object_concat_tuple (Object *tup1, Object *tup2);
 Object *object_getat_tuple (Object *tup, Object *idx);
 Object *object_getrange_tuple (Object *tup, Object *range);
+Object *object_dotprod_tuple (Object *tup1, Object *tup2);
+Object *object_eltmul_tuple (Object *tup1, Object *tup2);
+Object *object_eltadd_tuple (Object *tup1, Object *tup2);
+Object *object_eltsub_tuple (Object *tup1, Object *tup2);
+Object *object_map_tuple (Object *tup, Object *mapfn);
+Object *object_filter_tuple (Object *tup, Object *predfn);
+Object *object_fold_tuple (Object *tup, Object *foldfn, Object *inittup);
+Object *object_sort_tuple (Object *tup, Object *predfn);
 
 /* set #6 */
 Object *object_new_set (size_t cap);
@@ -442,6 +466,12 @@ Object *object_getrng_set (Object *set, Object *rng);
 void object_setrng_set (Object *set, Object *slice, Object *rng);
 Object *object_issubset_set (Object *set, Object *sub);
 Object *object_issuperset_set (Object *set, Object *sup);
+void object_catset_set (Object *set, Object *catset);
+void object_apply_set (Object *set, Object *applyfn);
+Object *object_map_set (Object *set, Object *mapfn);
+Object *object_filter_set (Object *set, Object *predfn);
+Object *object_fold_set (Object *set, Object *foldfn, Object *initset);
+void object_sort_set (Object *set, Object *predfn);
 
 /* set #7 */
 Object *object_new_string (const char32_t *from, size_t nfrom);
@@ -583,6 +613,5 @@ Object *object_sub_rational (object *bn1, object *bn2);
 Object *object_mul_rational (object *bn1, object *bn2);
 Object *object_pow_rational (object *bn1, object *bn2);
 Object *object_div_rational (object *bn1, object *bn2);
-
 
 #endif
