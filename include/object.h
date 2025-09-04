@@ -15,6 +15,7 @@
 #define OBJ_AsList(o) (o->as.value->as.list)
 #define OBJ_AsArray(o) (o->as.value->as.array)
 #define OBJ_AsTuple(o) (o->as.value->as.tuple)
+#define OBJ_AsSet(o) (o->as.value->as.set)
 #define OBJ_AsString(o) (o->as.value->as.string)
 #define OBJ_AsHash(o) (o->as.value->as.hash)
 #define OBJ_AsClass(o) (o->as.value->as.cls)
@@ -24,6 +25,7 @@
 #define OBJ_AsPattern(o) (o->as.value->as.pattern)
 #define OBJ_AsMatchResult(o) (o->as.value->as.matchresult)
 #define OBJ_AsGrammar(o) (o->as.value->as.grammar)
+#define OBJ_AsParser(o) (o->as.value->as.parser)
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
 #define OBJ_AsBoolean(o) (o->as.boolean)
@@ -38,6 +40,7 @@ struct Value
     VAL_List,
     VAL_Array,
     VAL_Tuple,
+    VAL_Set,
     VAL_String,
     VAL_Hash,
     VAL_Class,
@@ -48,6 +51,7 @@ struct Value
     VAL_Pattern,
     VAL_MatchResult,
     VAL_Grammar,
+    VAL_Parser,
   } type;
 
   union
@@ -65,9 +69,15 @@ struct Value
 
     struct Tuple
     {
-      Object **data;
+      Object **elts;
       size_t cnt;
     } tuple;
+
+    struct Set
+    {
+      Object **membs;
+      size_t cnt, cap;
+    } set;
 
     struct String
     {
@@ -93,12 +103,9 @@ struct Value
       Object *super;
       Object *fields;
       Object *methods;
-      Object **cnsts;
-      size_t cntmethods, capmethods;
-      size_t cntfields, capfields;
-      size_t cntcnsts, capcnsts;
-
+      Object *cnsts;
       Symtbl *env;
+      ASTNode *src;
     } cls;
 
     struct Port
@@ -113,9 +120,7 @@ struct Value
     struct Closure
     {
       Object *cnsts;
-      Instr *prog;
-      size_t cntcnsts, capcnsts;
-      size_t cntprog, capprog;
+      Object *prog;
 
       Object *parent;
       size_t nformals;
@@ -171,9 +176,7 @@ struct Value
     struct MatchResult
     {
       Object *captrngs;
-      size_t cntcaptrngs;
       Object *matchrngs;
-      size_t cntmatchrngs;
       bool success;
       Object *matchstr;
     } matchresult;
@@ -181,18 +184,34 @@ struct Value
     struct Grammar
     {
       Object *terms;
-      size_t cntterms, capterms;
       Object *nterms;
-      size_t cntnterms, capnterms;
       struct Production
       {
         Object *lhs;
         Object *rhs;
         Object *semaction;
-        int dotpos;
       } *prods;
       size_t cntprods, capprods;
     } grammar;
+
+    struct Parser
+    {
+      struct ParseTableEntry
+      {
+        enum ParseAction
+        {
+          PTABLE_Predict,
+          PTABLE_Error,
+        } type;
+        size_t predidx;
+      } *entries;
+      size_t nentires, capentries;
+      Object *eps;
+      Object *firsts;
+      Object *follows;
+      Object *predicts;
+      Object *srcgrm;
+    } parser;
   } as;
 };
 
@@ -249,18 +268,29 @@ Object *object_new_list (void);
 void object_delete_list (Object *lst);
 void object_appenditem_list (Object *lst, Object *newobj);
 void object_deleteitem_list (Object *lst, Object *delobj);
-Object *object_getrange_list (Object *lst, Object *range);
-Object *object_setrange_list (Object *lst, Object *newrng, Object *range);
+Object *object_getrange_list (Object *lst, Object *rng);
+void object_setrange_list (Object *lst, Object *slice, Object *rng);
 
 Object *object_new_array (size_t cap);
 void object_delete_array (Object *arr);
 Object *object_getrange_array (Object *arr, Object *range);
-void object_setrange_array (Object *arr, Object *newrng, Object *range);
+void object_setrange_array (Object *arr, Object *slice, Object *rng);
 
 Object *object_new_tuple (size_t cnt, ...);
 void object_delete_tuple (Object *tup);
 Object *object_getrange_array (Object *tup, Object *range);
-void object_setrange_array (Object *tup, Object *newrng, Object *range);
+void object_setrange_array (Object *tup, Object *slice, Object *rng);
+
+Object *object_new_set (size_t cap);
+void object_delete_set (Object *set);
+Object *object_insert_set (Object *set, Object *item);
+Object *object_union_set (Object *set1, Object *set2);
+Object *object_intersect_set (Object *set1, Object *set2);
+Object *object_differ_set (Object *set1, Object *set2);
+void object_setidx_set (Object *set, Object *idx, Object *item);
+Object *object_getidx_set (Object *set, Object *idx);
+Object *object_getrng_set (Object *set, Object *rng);
+void object_setrng_set (Object *set, Object *slice, Object *rng);
 
 Object *object_new_string (const char32_t *from, size_t nfrom);
 void object_delete_string (Object *str);
@@ -339,5 +369,13 @@ void object_addterm_grammar (Object *grm, Object *term);
 void object_addnterm_grammar (Object *grm, Object *nterm);
 void object_addprod_grammar (Object *grm, Object *lhs, Object *rhs,
                              Object *semaction);
+
+Object *object_new_parser (Object *srcgrm);
+void object_delete_parser (Object *prs);
+void object_addentry_parser (Object *prs, ParseAction action, size_t predidx);
+void object_addeps_parser (Object *prs, Object *eps);
+void object_addfirst_parser (Object *prs, Object *first);
+void object_addfollow_parser (Object *prs, Object *follow);
+void object_addpredict_parser (Object *prs, Object *predict);
 
 #endif
