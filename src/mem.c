@@ -175,6 +175,12 @@ gc_mark (Object *obj)
       gc_mark (OBJ_AsPolyhedron (obj).cnstterms);
       gc_mark (OBJ_AsPolyhedron (obj).ineqs);
       continue;
+    case VAL_ILattice:
+      gc_mark (OBJ_AsILattice (obj).dim);
+      gc_mark (OBJ_AsILattice (obj).rank);
+      gc_mark (OBJ_AsILattice (obj).basis);
+      gc_mark (OBJ_AsILattice (obj).offset);
+      continue;
     case VAL_Emitter:
       // TODO
     default:
@@ -361,6 +367,12 @@ gc_update_obj_ref (Object *obj)
       gc_update_obj_ref (OBJ_AsPolyhedron (obj).coeffmats);
       gc_update_obj_ref (OBJ_AsPolyhedron (obj).cnstterms);
       gc_update_obj_ref (OBJ_AsPolyhedron (obj).ineqs);
+      continue;
+    case VAL_ILattice:
+      gc_update_obj_ref (OBJ_AsILattice (obj).dim);
+      gc_update_obj_ref (OBJ_AsILattice (obj).rank);
+      gc_update_obj_ref (OBJ_AsILattice (obj).basis);
+      gc_update_obj_ref (OBJ_AsILattice (obj).offset);
       continue;
     case VAL_Emitter:
       // TODO
