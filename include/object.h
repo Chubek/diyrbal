@@ -33,6 +33,7 @@
 #define OBJ_AsTree(o) (o->as.value->as.tree)
 #define OBJ_AsEmitter(o) (o->as.value->as.emitter)
 #define OBJ_AsPolyhedron(o) (o->as.value->as.polyhedron)
+#define OBJ_AsILattice(o) (o->as.value->as.ilattice)
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
 #define OBJ_AsBoolean(o) (o->as.boolean)
@@ -65,6 +66,7 @@ struct Value
     VAL_Tree,
     VAL_Graph,
     VAL_Polyhedron,
+    VAL_ILattice,
     VAL_Emitter,
   } type;
 
@@ -293,6 +295,14 @@ struct Value
       Object *ineqs;
     } polyhedron;
 
+    struct ILattice
+    {
+      Object *dim;
+      Object *rank;
+      Object *basis;
+      Object *offset;
+    } ilattice;
+
     struct Emitter
     {
       // TODO
@@ -510,5 +520,9 @@ Object *object_new_coroutine (Object *fn, Context *ctx, int id);
 
 /* set #22 */
 Object *object_new_polyhedron (Object *dims);
+
+/* set #23 */
+Object *object_new_ilattice (Object *dim, Object *rank, Object *basis,
+                             Object *offset);
 
 #endif
