@@ -1,5 +1,5 @@
-#ifndef VALECT_H
-#define VALECT_H
+#ifndef OBJECT_H
+#define OBJECT_H
 
 #include <stdarg.h>
 #include <stdbool.h>
