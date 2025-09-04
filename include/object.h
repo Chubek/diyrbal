@@ -23,6 +23,7 @@
 #define OBJ_AsBox(o) (o->as.value->as.box)
 #define OBJ_AsPattern(o) (o->as.value->as.pattern)
 #define OBJ_AsMatchResult(o) (o->as.value->as.matchresult)
+#define OBJ_AsGrammar(o) (o->as.value->as.grammar)
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
 #define OBJ_AsBoolean(o) (o->as.boolean)
@@ -44,6 +45,9 @@ struct Value
     VAL_Closure,
     VAL_Prog,
     VAL_Box,
+    VAL_Pattern,
+    VAL_MatchResult,
+    VAL_Grammar,
   } type;
 
   union
@@ -173,6 +177,22 @@ struct Value
       bool success;
       Object *matchstr;
     } matchresult;
+
+    struct Grammar
+    {
+      Object *terms;
+      size_t cntterms, capterms;
+      Object *nterms;
+      size_t cntnterms, capnterms;
+      struct Production
+      {
+        Object *lhs;
+        Object *rhs;
+        Object *semaction;
+        int dotpos;
+      } *prods;
+      size_t cntprods, capprods;
+    } grammar;
   } as;
 };
 
@@ -197,7 +217,7 @@ struct Object
     double real;
     bool boolean;
     char32_t chr;
-    const char symbol[SYM_SIZE + 1];
+    uint32_t symbol;
     struct Range
     {
       uint64_t start : 31;
@@ -221,7 +241,7 @@ static void object_delete_value (Object *obj);
 Object *object_new_integer (intmax_t ival);
 Object *object_new_real (double rval);
 Object *object_new_boolean (bool bval);
-Object *object_new_symbol (const char sval);
+Object *object_new_symbol (const char *sval);
 Object *object_new_range (int start, int end, int step);
 Object *object_new_char (char32_t chrval);
 
@@ -312,5 +332,12 @@ void object_delete_matchresult (Object *mres);
 void object_addcaptrng_matchresult (Object *mres, Object *crng);
 void object_addmatchrng_matchresult (Object *mres, Object *mrng);
 void object_setsuccess_matchresult (Object *mres, bool succres);
+
+Object *object_new_grammar (void);
+void object_delete_grammar (Object *grm);
+void object_addterm_grammar (Object *grm, Object *term);
+void object_addnterm_grammar (Object *grm, Object *nterm);
+void object_addprod_grammar (Object *grm, Object *lhs, Object *rhs,
+                             Object *semaction);
 
 #endif
