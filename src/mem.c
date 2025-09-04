@@ -89,7 +89,11 @@ gc_mark (Object *obj)
       continue;
     case VAL_Tuple:
       for (size_t i = 0; i < OBJ_AsTuple (obj).cnt; i++)
-        gc_mark (OBJ_AsTuple (obj).data[i]);
+        gc_mark (OBJ_AsTuple (obj).elts[i]);
+      continue;
+    case VAL_Set:
+      for (size_t i = 0; i < OBJ_AsSet (obj).cnt; i++)
+        gc_mark (OBJ_AsTuple (obj).membs[i]);
       continue;
     case VAL_Hash:
       for (size_t i = 0; i < OBJ_AsHash (obj).cap; i++)
@@ -124,7 +128,7 @@ gc_mark (Object *obj)
             gc_mark (b->objref);
         }
       break;
-    case OBJ_Grammar:
+    case VAL_Grammar:
       gc_mark (OBJ_AsGrammar (obj).terms);
       gc_mark (OBJ_AsGrammar (obj).nterms);
       for (size_t i = 0; i < OBJ_AsGrammar (obj).cntprods; i++)
@@ -133,6 +137,12 @@ gc_mark (Object *obj)
           gc_mark (prod->rhs);
           gc_mark (prod->lhs);
         }
+      continue;
+    case VAL_Parser:
+      gc_mark (OBJ_AsParser (obj).eps);
+      gc_mark (OBJ_AsParser (obj).firsts);
+      gc_mark (OBJ_AsParser (obj).follows);
+      gc_mark (OBJ_AsParser (obj).predicts);
       continue;
     default:
       continue;
@@ -231,7 +241,11 @@ gc_update_obj_ref (Object *obj)
       continue;
     case VAL_Tuple:
       for (size_t i = 0; i < OBJ_AsTuple (obj).cnt; i++)
-        gc_update_ref (&OBJ_AsTuple (obj).data[i]);
+        gc_update_ref (&OBJ_AsTuple (obj).elts[i]);
+      continue;
+    case VAL_Set:
+      for (size_t i = 0; i < OBJ_AsSet (obj).cnt; i++)
+        gc_update_ref (&OBJ_AsTuple (obj).membs[i]);
       continue;
     case VAL_Hash:
       for (size_t i = 0; i < OBJ_AsHash (obj).cap; i++)
@@ -274,6 +288,12 @@ gc_update_obj_ref (Object *obj)
           gc_update_ref (prod->lhs);
           gc_update_obj_ref (prod->rhs);
         }
+      continue;
+    case VAL_Parser:
+      gc_update_obj_ref (OBJ_AsParser (obj).eps);
+      gc_update_obj_ref (OBJ_AsParser (obj).firsts);
+      gc_update_obj_ref (OBJ_AsParser (obj).follows);
+      gc_update_obj_ref (OBJ_AsParser (obj).predicts;);
       continue;
     default:
       gc_update_ref (&obj);
