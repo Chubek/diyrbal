@@ -124,6 +124,16 @@ gc_mark (Object *obj)
             gc_mark (b->objref);
         }
       break;
+    case OBJ_Grammar:
+      gc_mark (OBJ_AsGrammar (obj).terms);
+      gc_mark (OBJ_AsGrammar (obj).nterms);
+      for (size_t i = 0; i < OBJ_AsGrammar (obj).cntprods; i++)
+        {
+          Production *prod = &OBJ_AsGrammar (obj).prods[i];
+          gc_mark (prod->rhs);
+          gc_mark (prod->lhs);
+        }
+      continue;
     default:
       continue;
     }
@@ -255,6 +265,16 @@ gc_update_obj_ref (Object *obj)
           if (b->closed)
             gc_update_ref (&b->objref);
         }
+    case VAL_Grammar:
+      gc_update_obj_ref (OBJ_AsGrammar (obj).terms);
+      gc_update_obj_ref (OBJ_AsGrammar (obj).nterms);
+      for (size_t i = 0; i < OBJ_AsGrammar (obj).cntprods; i++)
+        {
+          Production *prod = &OBJ_AsGrammar (obj).prods[i];
+          gc_update_ref (prod->lhs);
+          gc_update_obj_ref (prod->rhs);
+        }
+      continue;
     default:
       gc_update_ref (&obj);
       continue;
