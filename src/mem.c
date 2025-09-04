@@ -86,6 +86,7 @@ gc_mark (Object *obj)
     case VAL_Array:
       for (size_t i = 0; i < OBJ_AsArray (obj).cnt; i++)
         gc_mark (OBJ_AsArray (obj).data[i]);
+      gc_mark (OBJ_AsArray (obj).dims);
       continue;
     case VAL_Tuple:
       for (size_t i = 0; i < OBJ_AsTuple (obj).cnt; i++)
@@ -167,6 +168,12 @@ gc_mark (Object *obj)
       continue;
     case VAL_Coroutine:
       gc_mark (OBJ_AsCoroutine (obj).fn);
+      continue;
+    case VAL_Polyhedron:
+      gc_mark (OBJ_AsPolyhedron (obj).dims);
+      gc_mark (OBJ_AsPolyhedron (obj).coeffmats);
+      gc_mark (OBJ_AsPolyhedron (obj).cnstterms);
+      gc_mark (OBJ_AsPolyhedron (obj).ineqs);
       continue;
     case VAL_Emitter:
       // TODO
@@ -264,6 +271,7 @@ gc_update_obj_ref (Object *obj)
     case VAL_Array:
       for (size_t i = 0; i < OBJ_AsArray (obj).cnt; i++)
         gc_update_ref (&OBJ_AsArray (obj).data[i]);
+      gc_update_ref (&OBJ_AsArray (obj).dims);
       continue;
     case VAL_Tuple:
       for (size_t i = 0; i < OBJ_AsTuple (obj).cnt; i++)
@@ -347,6 +355,12 @@ gc_update_obj_ref (Object *obj)
       continue;
     case VAL_Coroutine:
       gc_update_object_ref (OBJ_AsCoroutine (obj).fn);
+      continue;
+    case VAL_Polyhedron:
+      gc_update_obj_ref (OBJ_AsPolyhedron (obj).dims);
+      gc_update_obj_ref (OBJ_AsPolyhedron (obj).coeffmats);
+      gc_update_obj_ref (OBJ_AsPolyhedron (obj).cnstterms);
+      gc_update_obj_ref (OBJ_AsPolyhedron (obj).ineqs);
       continue;
     case VAL_Emitter:
       // TODO
