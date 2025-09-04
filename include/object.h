@@ -16,6 +16,7 @@
 #define OBJ_AsArray(o) (o->as.value->as.array)
 #define OBJ_AsTuple(o) (o->as.value->as.tuple)
 #define OBJ_AsSet(o) (o->as.value->as.set)
+#define OBJ_AsBignum(o) (o->as.value->as.bignum)
 #define OBJ_AsString(o) (o->as.value->as.string)
 #define OBJ_AsHash(o) (o->as.value->as.hash)
 #define OBJ_AsClass(o) (o->as.value->as.cls)
@@ -50,6 +51,7 @@ struct Value
     VAL_Array,
     VAL_Tuple,
     VAL_Set,
+    VAL_Bignum,
     VAL_String,
     VAL_Hash,
     VAL_Class,
@@ -96,6 +98,24 @@ struct Value
       size_t cnt, cap;
       bool frozen;
     } set;
+
+    struct Bignum
+    {
+      struct BinPack
+      {
+        uint8_t a : 1;
+        uint8_t b : 1;
+        uint8_t c : 1;
+        uint8_t d : 1;
+        uint8_t e : 1;
+        uint8_t f : 1;
+        uint8_t g : 1;
+        uint8_t h : 1;
+      } *packs;
+      int cntpacks;
+      Object *frombase;
+      Object *src;
+    } bignum;
 
     struct String
     {
@@ -524,5 +544,20 @@ Object *object_new_polyhedron (Object *dims);
 /* set #23 */
 Object *object_new_ilattice (Object *dim, Object *rank, Object *basis,
                              Object *offset);
+
+/* set #24 */
+Object *object_new_bignum (void);
+Object *object_fromstr_bignum (Object *nsrc, Object *frombase);
+Object *object_add_bignum (Object *bn1, Object *bn2);
+Object *object_sub_bignum (Object *bn1, Object *bn2);
+Object *object_mul_bignum (Object *bn1, Object *bn2);
+Object *object_idiv_bignum (Object *bn1, Object *bn2);
+Object *object_fdiv_bignum (Object *bn1, Object *bn2);
+Object *object_mod_bignum (Object *bn1, Object *bn2);
+Object *object_shr_bignum (Object *bn1, Object *bn2);
+Object *object_shl_bignum (Object *bn1, Object *bn2);
+Object *object_bitand_bignum (Object *bn1, Object *bn2);
+Object *object_bitor_bignum (Object *bn1, Object *bn2);
+Object *object_bitxor_bignum (Object *bn1, Object *bn2);
 
 #endif
