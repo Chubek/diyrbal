@@ -27,6 +27,10 @@
 #define OBJ_AsMatchResult(o) (o->as.value->as.matchresult)
 #define OBJ_AsGrammar(o) (o->as.value->as.grammar)
 #define OBJ_AsParser(o) (o->as.value->as.parser)
+#define OBJ_AsDSL(o) (o->as.value->as.dsl)
+#define OBJ_AsGraph(o) (o->as.value->as.graph)
+#define OBJ_AsTree(o) (o->as.value->as.tree)
+#define OBJ_AsEmitter(o) (o->as.value->as.emitter)
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
 #define OBJ_AsBoolean(o) (o->as.boolean)
@@ -54,6 +58,10 @@ struct Value
     VAL_MatchResult,
     VAL_Grammar,
     VAL_Parser,
+    VAL_DSL,
+    VAL_Tree,
+    VAL_Graph,
+    VAL_Emitter,
   } type;
 
   union
@@ -67,6 +75,7 @@ struct Value
     {
       Object **data;
       size_t cnt, cap;
+      Object *dims;
     } array;
 
     struct Tuple
@@ -227,6 +236,40 @@ struct Value
       Object *predicts;
       Object *srcgrm;
     } parser;
+
+    struct DSL
+    {
+      Object *grammar;
+      Object *absyn;
+      Object *states;
+      Object *emitter;
+      struct Triple
+      {
+        Object *precond;
+        Object *stmt;
+        Object *postcond;
+      } *triples;
+      size_t cnttriples, captriples;
+      Symtbl *env;
+      Object *src;
+    } dsl;
+
+    struct Tree
+    {
+      Object *data;
+      Object *children;
+    } tree;
+
+    struct Graph
+    {
+      Object *nodes;
+      Object *incdmat;
+    } graph;
+
+    struct Emitter
+    {
+      // TODO
+    } emitter;
   } as;
 };
 
@@ -286,7 +329,7 @@ Object *object_new_nil (void);
 /* set #3 */
 Object *object_new_list (void);
 void object_append_list (Object *lst, Object *newobj);
-void object_delitem_list (Object *lst, Object *delobj);
+void object_delitem_list (Object *lst, Object *idx);
 Object *object_reverse_list (Object *lst);
 Object *object_idxof_list (Object *lst, Object *item);
 Object *object_shift_list (Object *lst);
@@ -297,12 +340,15 @@ Object *object_getrange_list (Object *lst, Object *rng);
 void object_setrange_list (Object *lst, Object *slice, Object *rng);
 
 /* set #4 */
-Object *object_new_array (size_t cap);
-void object_insert_array (Object *arr, Object *item);
-Object *object_getat_array (Object *arr, Object *item);
-void object_setat_array (Object *arr, Object *newitem, Object *idx);
-Object *object_getrange_array (Object *arr, Object *range);
-void object_setrange_array (Object *arr, Object *slice, Object *rng);
+Object *object_new_array (size_t cap, Object *dims);
+void object_insert_array (Object *arr, Object *item, Object *dim);
+Object *object_idxof_array (Object *arr, Object *item);
+Object *object_getat_array (Object *arr, Object *idx, Object *dim);
+void object_setat_array (Object *arr, Object *newitem, Object *idx,
+                         Object *dim);
+Object *object_getrange_array (Object *arr, Object *range, Object *dim);
+void object_setrange_array (Object *arr, Object *slice, Object *rng,
+                            Object *dim);
 
 /* set #5 */
 Object *object_new_tuple (size_t cnt, ...);
@@ -416,5 +462,20 @@ void object_addpredict_parser (Object *prs, Object *predict);
 Object *object_new_prog (const Object *src);
 void object_pushinstr_prog (Object *prog, Opcode opcode, Object *operand);
 void object_popinstr_prog (Object *prog, Instr *instrdst);
+
+/* set #18 */
+Object *object_new_dsl (Object *grm, Object *absyn, Object *stt, Object *emt);
+void object_pushtriple_dsl (Object *dsl, Object *precond, Object *stmt,
+                            Object *postcond);
+void object_gettriple_dsl (Object *dsl, Object **tripledst, size_t idx);
+
+/* Set #19 */
+Object *object_new_tree (void);
+void object_addchild_tree (Object *tree, Object *data);
+
+/* Set #20 */
+Object *object_new_graph (void);
+void object_addnode_graph (Object *grph, Object *node);
+void object_connode_graph (Object *grph, Object *from, Object *to);
 
 #endif
