@@ -2,4 +2,4 @@
 
 Diyrbal is currently under development. Meanwhile, enjoy _Ern_, the mascot for Diyrbal (a koala). 
 
-![Diyrboll](diyrboll.png)
+![Ern, the Diyrbal mascot](ern.png)
