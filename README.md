@@ -1,5 +1,5 @@
-# Diyrbal: an scripting language with a "Down Under" flavor
+# Diyrbal: an scripting language WIP
 
-Diyrbal is currently under development. Meanwhile, enjoy _Diyrboll_, the mascot for Diyrbal. 
+Diyrbal is currently under development. Meanwhile, enjoy _Ern_, the mascot for Diyrbal (a koala). 
 
 ![Diyrboll](diyrboll.png)
