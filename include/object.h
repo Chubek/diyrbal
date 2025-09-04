@@ -21,6 +21,7 @@
 #define OBJ_AsClass(o) (o->as.value->as.cls)
 #define OBJ_AsPort(o) (o->as.value->as.port)
 #define OBJ_AsClosure(o) (o->as.value->as.closure)
+#define OBJ_AsCoroutine(o) (o->as.value->as.coroutine)
 #define OBJ_AsProg(o) (o->as.value->as.prog)
 #define OBJ_AsBox(o) (o->as.value->as.box)
 #define OBJ_AsPattern(o) (o->as.value->as.pattern)
@@ -52,6 +53,7 @@ struct Value
     VAL_Class,
     VAL_Port,
     VAL_Closure,
+    VAL_Coroutine,
     VAL_Prog,
     VAL_Box,
     VAL_Pattern,
@@ -141,6 +143,21 @@ struct Value
       ASTNode *srcnode;
       Object *boxchain;
     } closure;
+
+    struct Coroutine
+    {
+      enum CoroState
+      {
+        CORO_Ready,
+        CORO_Running,
+        CORO_Suspended,
+        CORO_Done,
+      } state;
+
+      Object *fn;
+      Context *ctx;
+      int id;
+    } coroutine;
 
     struct Prog
     {
@@ -469,13 +486,17 @@ void object_pushtriple_dsl (Object *dsl, Object *precond, Object *stmt,
                             Object *postcond);
 void object_gettriple_dsl (Object *dsl, Object **tripledst, size_t idx);
 
-/* Set #19 */
+/* set #19 */
 Object *object_new_tree (void);
 void object_addchild_tree (Object *tree, Object *data);
 
-/* Set #20 */
+/* set #20 */
 Object *object_new_graph (void);
 void object_addnode_graph (Object *grph, Object *node);
 void object_connode_graph (Object *grph, Object *from, Object *to);
+
+/* set #21 */
+Object *object_new_coroutine (Object *fn, Context *ctx, int id);
+
 
 #endif
