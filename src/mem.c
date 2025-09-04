@@ -44,7 +44,7 @@ heap_push_root (Heap *h, Object *const newroot)
 
 void
 heap_push_frame_roots (Heap *h, Stackframe *frm)
-{ 
+{
   size_t i;
   for (i = 0; i < frm->nlocals; i++)
     heap_push_root (h, frm->locptr[i]);
@@ -70,9 +70,12 @@ heap_pop_frame_roots (Heap *h, Stackframe *frm)
 static void
 gc_mark (Object *obj)
 {
-  if (!obj || obj->marked || obj->type != OBJ_Value)
+  if (!obj || obj->marked)
     return;
   obj->marked = true;
+
+  if (obj->type != OBJ_Value)
+    return;
 
   switch (OBJ_ValueType (obj))
     {
@@ -186,7 +189,7 @@ gc_update_ref (Object **ref)
     return;
 
   Object *obj = *ref;
-  if (obj->marked && obj->type == OBJ_Value && obj->forwarding_addr)
+  if (obj->marked && obj->forwarding_addr)
     {
       *ref = obj->forwarding_addr;
       obj->forwarding_addr = NULL;
@@ -201,7 +204,10 @@ gc_update_obj_ref (Object *obj)
 {
 
   if (obj->type != OBJ_Value)
-    continue;
+    {
+      gc_update_ref (&obj);
+      return;
+    }
 
   switch (OBJ_ValueType (obj))
     {
@@ -250,6 +256,7 @@ gc_update_obj_ref (Object *obj)
             gc_update_ref (&b->objref);
         }
     default:
+      gc_update_ref (&obj);
       continue;
     }
 }
