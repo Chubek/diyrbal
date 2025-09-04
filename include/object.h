@@ -21,6 +21,7 @@
 #define OBJ_AsClass(o) (o->as.value->as.cls)
 #define OBJ_AsPort(o) (o->as.value->as.port)
 #define OBJ_AsClosure(o) (o->as.value->as.closure)
+#define OBJ_AsProg(o) (o->as.value->as.prog)
 #define OBJ_AsBox(o) (o->as.value->as.box)
 #define OBJ_AsPattern(o) (o->as.value->as.pattern)
 #define OBJ_AsMatchResult(o) (o->as.value->as.matchresult)
@@ -29,7 +30,7 @@
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
 #define OBJ_AsBoolean(o) (o->as.boolean)
-#define OBJ_AsSymbol(o) (&o->as.symbol[0])
+#define OBJ_AsSymbol(o) (o->as.symbol)
 #define OBJ_AsRange(o) (o->as.range)
 #define OBJ_AsChar(o) (o->as.chr)
 #define OBJ_AsCfunc(o) (o->as.cfunc)
@@ -131,6 +132,18 @@ struct Value
       Object *boxchain;
     } closure;
 
+    struct Prog
+    {
+      struct Instr
+      {
+        Opcode opcode;
+        Object *operand;
+      } *instrs;
+      size_t cntinstrs, capinstrs;
+      int localpc;
+      const Object *src;
+    } prog;
+
     struct Box
     {
       Object *objref;
@@ -228,6 +241,7 @@ struct Object
     OBJ_Symbol,
     OBJ_Range,
     OBJ_Nil,
+    OBJ_CFunc,
   } type;
 
   union
@@ -254,11 +268,11 @@ struct Object
   Hashfn *hashfunc;
 };
 
+/* set #1 */
 static Object *object_new (ObjType type);
-static void object_delete (Object *obj);
 static Object *object_new_value (ValueType type);
-static void object_delete_value (Object *obj);
 
+/* set #2 */
 Object *object_new_integer (intmax_t ival);
 Object *object_new_real (double rval);
 Object *object_new_boolean (bool bval);
@@ -266,26 +280,27 @@ Object *object_new_symbol (const char *sval);
 Object *object_new_range (int start, int end, int step);
 Object *object_new_char (char32_t chrval);
 Object *object_new_cfunc (CFunc *cfnval);
+Object *object_new_nil (void);
 
+/* set #3 */
 Object *object_new_list (void);
-void object_delete_list (Object *lst);
 void object_appenditem_list (Object *lst, Object *newobj);
 void object_deleteitem_list (Object *lst, Object *delobj);
 Object *object_getrange_list (Object *lst, Object *rng);
 void object_setrange_list (Object *lst, Object *slice, Object *rng);
 
+/* set #4 */
 Object *object_new_array (size_t cap);
-void object_delete_array (Object *arr);
 Object *object_getrange_array (Object *arr, Object *range);
 void object_setrange_array (Object *arr, Object *slice, Object *rng);
 
+/* set #5 */
 Object *object_new_tuple (size_t cnt, ...);
-void object_delete_tuple (Object *tup);
 Object *object_getrange_array (Object *tup, Object *range);
 void object_setrange_array (Object *tup, Object *slice, Object *rng);
 
+/* set #6 */
 Object *object_new_set (size_t cap);
-void object_delete_set (Object *set);
 Object *object_insert_set (Object *set, Object *item);
 Object *object_union_set (Object *set1, Object *set2);
 Object *object_intersect_set (Object *set1, Object *set2);
@@ -295,8 +310,8 @@ Object *object_getidx_set (Object *set, Object *idx);
 Object *object_getrng_set (Object *set, Object *rng);
 void object_setrng_set (Object *set, Object *slice, Object *rng);
 
+/* set #7 */
 Object *object_new_string (const char32_t *from, size_t nfrom);
-void object_delete_string (Object *str);
 Object *object_appendchar_string (Object *str, Object *chr);
 Object *object_catstr_string (Object *str1, Object *str2);
 Object *object_getrange_string (Object *str, Object *range);
@@ -305,16 +320,16 @@ Object *object_getlen_string (Object *str);
 Object *object_matchpatt_string (Object *str, Object *patt);
 Object *object_findpatt_string (Object *str, Object *patt);
 
+/* set #8 */
 Object *object_new_hash (size_t cap);
-void object_delete_hash (Object *hash);
 void object_setitem_hash (Object *hash, const Object *key, Object *value);
 bool object_getitem_hash (Object *hash, const Object *key, Object **valdst);
 bool object_delitem_hash (Object *hash, const Object *key);
 static bool object_shoudgrow_hash (Object *hash);
 static void object_grow_hash (Object *hash);
 
+/* set #9 */
 Object *object_new_closure (Object *parent, size_t nformals, bool isvarargs);
-void object_delete_closure (Object *clsr);
 void object_setenv_closure (Object *clsr, const Object *symbol, Object *value);
 Object *object_getenv_closure (Object *clsr, const Object *symbol);
 void object_addbox_closure (Closure *clsr, Object *box);
@@ -322,21 +337,21 @@ void object_addconst_closure (Closure *clsr, Object *cnst);
 void object_addinstr_closure (Closure *clsr, Instr *instr);
 void object_execute_closure (Closure *clsr, Interp *interp);
 
+/* set #10 */
 Object *object_new_box (Object *obref, int nestlvl);
-void object_delete_box (Object *box);
 void object_closeiflvl_box (Object *box, int lvlcond);
 
+/* set #11 */
 Object *object_new_class (Object *super);
-void object_delete_class (Object *cls);
 void object_fieldfn_class (Object *cls, const Object *name, Object *value);
 void object_methdfn_class (Object *cls, const Object *name, Object *method);
 void object_cnstadd_class (Object *cls, Object *cnst);
 Object *object_getsym_class (Object *cls, const Object *name);
 Object *object_getcsnt_class (Object *cls, size_t offs);
 
+/* set #12 */
 Object *object_new_port (Object *path, bool r, bool w, bool a, bool b,
                          int stdfd);
-void object_delete_port (Object *port);
 void object_openstrm_port (Object *port);
 void object_closestrm_port (Object *port);
 Object *object_readline_port (Object *port);
@@ -352,33 +367,38 @@ void object_writenchars_port (Object *port, Object **chrs, size_t n);
 void object_setseek_port (Object *port, Object *nseek, int rel);
 Object *object_getseek_port (Object *port);
 
+/* set #13 */
 Object *object_new_pattern (Object *srcstr);
-void object_delete_pattern (Object *patt);
 void object_addelt_pattern (Object *patt, PatternType type,
                             PatternQuantifier quant, bool nongreedy,
                             bool inverted, uint8_t literal, uint8_t clsname,
                             uint8_t *bitmap);
 Object *object_runmatch_pattern (Object *patt, Object *matchstr);
 
+/* set #14 */
 Object *object_new_matchresult (Object *matchstr);
-void object_delete_matchresult (Object *mres);
 void object_addcaptrng_matchresult (Object *mres, Object *crng);
 void object_addmatchrng_matchresult (Object *mres, Object *mrng);
 void object_setsuccess_matchresult (Object *mres, bool succres);
 
+/* set #15 */
 Object *object_new_grammar (void);
-void object_delete_grammar (Object *grm);
 void object_addterm_grammar (Object *grm, Object *term);
 void object_addnterm_grammar (Object *grm, Object *nterm);
 void object_addprod_grammar (Object *grm, Object *lhs, Object *rhs,
                              Object *semaction);
 
+/* set #16 */
 Object *object_new_parser (Object *srcgrm);
-void object_delete_parser (Object *prs);
 void object_addentry_parser (Object *prs, ParseAction action, size_t predidx);
 void object_addeps_parser (Object *prs, Object *eps);
 void object_addfirst_parser (Object *prs, Object *first);
 void object_addfollow_parser (Object *prs, Object *follow);
 void object_addpredict_parser (Object *prs, Object *predict);
+
+/* set #17 */
+Object *object_new_prog (const Object *src);
+void object_pushinstr_prog (Object *prog, Opcode opcode, Object *operand);
+void object_popinstr_prog (Object *prog, Instr *instrdst);
 
 #endif
