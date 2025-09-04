@@ -286,7 +286,8 @@ Object *object_new_nil (void);
 /* set #3 */
 Object *object_new_list (void);
 void object_append_list (Object *lst, Object *newobj);
-void object_delete_list (Object *lst, Object *delobj);
+void object_delitem_list (Object *lst, Object *delobj);
+Object *object_reverse_list (Object *lst);
 Object *object_idxof_list (Object *lst, Object *item);
 Object *object_shift_list (Object *lst);
 Object *object_pop_list (Object *lst);
