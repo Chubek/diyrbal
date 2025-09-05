@@ -20,6 +20,7 @@
 #define OBJ_AsBignum(o) (o->as.value->as.bignum)
 #define OBJ_AsRational(o) (o->as.value->as.rational)
 #define OBJ_AsString(o) (o->as.value->as.string)
+#define OBJ_AsBuffer(o) (o->as.value->as.buffer)
 #define OBJ_AsHash(o) (o->as.value->as.hash)
 #define OBJ_AsClass(o) (o->as.value->as.cls)
 #define OBJ_AsPort(o) (o->as.value->as.port)
@@ -57,6 +58,7 @@ struct Value
     VAL_Bignum,
     VAL_Rational,
     VAL_String,
+    VAL_Buffer,
     VAL_Hash,
     VAL_Class,
     VAL_Port,
@@ -134,6 +136,13 @@ struct Value
       size_t len, cap;
       bool utf8;
     } string;
+
+    struct Buffer
+    {
+      uint8_t *data;
+      size_t size, cap;
+      const char *aux;
+    } buffer;
 
     struct Hash
     {
@@ -475,6 +484,7 @@ void object_sort_set (Object *set, Object *predfn);
 
 /* set #7 */
 Object *object_new_string (const char32_t *from, size_t nfrom);
+void object_dealloc_string (Object *str);
 Object *object_appendchar_string (Object *str, Object *chr);
 Object *object_catstr_string (Object *str1, Object *str2);
 Object *object_getrange_string (Object *str, Object *range);
@@ -517,11 +527,13 @@ Object *object_new_port (Object *path, bool r, bool w, bool a, bool b,
                          int stdfd);
 void object_openstrm_port (Object *port);
 void object_closestrm_port (Object *port);
+Object *object_readtobuffer_port (Object *port);
 Object *object_readline_port (Object *port);
 Object *object_readchar_port (Object *port);
 Object *object_readall_port (Object *port);
 Object **object_readnlines_port (Object *port, Object *n);
 Object **object_readnchars_port (Object *port, Object *n);
+void object_writefrombuffer_port (Object *port, Object *wbuff);
 void object_writeline_port (Object *port, Object *ln);
 void object_writechar_port (Object *port, Object *chr);
 void object_writeall_port (Object *port, Object *txt);
@@ -613,5 +625,11 @@ Object *object_sub_rational (object *bn1, object *bn2);
 Object *object_mul_rational (object *bn1, object *bn2);
 Object *object_pow_rational (object *bn1, object *bn2);
 Object *object_div_rational (object *bn1, object *bn2);
+
+/* set #26 */
+Object *object_new_buffer (uint8_t *data, const char *aux);
+void object_dealloc_buffer (Objet *buff);
+void object_append_buffer (Object *buff, const uint8_t *add);
+Object *object_slice_buffer (Object *buff, Object *rng);
 
 #endif
