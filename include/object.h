@@ -18,6 +18,7 @@
 #define OBJ_AsTuple(o) (o->as.value->as.tuple)
 #define OBJ_AsSet(o) (o->as.value->as.set)
 #define OBJ_AsBignum(o) (o->as.value->as.bignum)
+#define OBJ_AsDecimal(o) (o->as.value->as.decimal)
 #define OBJ_AsRational(o) (o->as.value->as.rational)
 #define OBJ_AsString(o) (o->as.value->as.string)
 #define OBJ_AsBuffer(o) (o->as.value->as.buffer)
@@ -38,6 +39,7 @@
 #define OBJ_AsEmitter(o) (o->as.value->as.emitter)
 #define OBJ_AsPolyhedron(o) (o->as.value->as.polyhedron)
 #define OBJ_AsILattice(o) (o->as.value->as.ilattice)
+#define OBJ_AsSignal(o) (o->as.value->as.signal)
 #define OBJ_AsInteger(o) (o->as.integer)
 #define OBJ_AsReal(o) (o->as.real)
 #define OBJ_AsComplex(o) (o->as.complx)
@@ -75,6 +77,7 @@ struct Value
     VAL_Graph,
     VAL_Polyhedron,
     VAL_ILattice,
+    VAL_Signal,
     VAL_Emitter,
   } type;
 
@@ -122,6 +125,14 @@ struct Value
       Object *frombase;
       Object *src;
     } bignum;
+
+    struct Decimal
+    {
+      bool neg;
+      Object *signif;
+      Object *base;
+      Object *exp;
+    } decimal;
 
     struct Rational
     {
@@ -342,6 +353,24 @@ struct Value
       Object *basis;
       Object *offset;
     } ilattice;
+
+    struct Signal
+    {
+      enum SigType
+      {
+        SIGT_Integer,
+        SIGT_Real,
+        SIGT_Complex,
+      } type;
+
+      Object *data;
+      Object *lenth;
+      Object *samprate;
+      Object *starttime;
+      Object *unit;
+      Object *minval, *maxval;
+      Object *isnrom;
+    } signal;
 
     struct Emitter
     {
@@ -626,9 +655,25 @@ Object *object_pow_rational (object *bn1, object *bn2);
 Object *object_div_rational (object *bn1, object *bn2);
 
 /* set #26 */
+Object *object_new_rational (void);
+Object *object_fromstr_rational (object *nsrc);
+Object *object_add_rational (object *bn1, object *bn2);
+Object *object_sub_rational (object *bn1, object *bn2);
+Object *object_mul_rational (object *bn1, object *bn2);
+Object *object_pow_rational (object *bn1, object *bn2);
+Object *object_div_rational (object *bn1, object *bn2);
+
+/* set #26 */
 Object *object_new_buffer (uint8_t *data, const char *aux);
 void object_dealloc_buffer (Objet *buff);
 void object_append_buffer (Object *buff, const uint8_t *add);
 Object *object_slice_buffer (Object *buff, Object *rng);
+
+/* set #27 */
+Object *object_new_signal (SigType type, Object *length, Object *samprate);
+Object *object_getsamble_signal (Object *sig, Object *idx);
+Object *object_gettimeidx_signal (Object *sig, Object *idx);
+void object_setsample_signal (Object *sig, Object *idx, Object *data);
+void object_normalize_signal (Object *sig);
 
 #endif
