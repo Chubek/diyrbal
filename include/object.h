@@ -112,14 +112,14 @@ struct Value
     {
       struct BinPack
       {
-        uint8_t a : 1;
-        uint8_t b : 1;
-        uint8_t c : 1;
-        uint8_t d : 1;
-        uint8_t e : 1;
-        uint8_t f : 1;
-        uint8_t g : 1;
-        uint8_t h : 1;
+        uint8_t b1 : 1;
+        uint8_t b2 : 1;
+        uint8_t b3 : 1;
+        uint8_t b4 : 1;
+        uint8_t b5 : 1;
+        uint8_t b6 : 1;
+        uint8_t b7 : 1;
+        uint8_t b8 : 1;
       } *packs;
       int cntpacks;
       Object *frombase;
@@ -648,20 +648,20 @@ Object *object_bitxor_bignum (object *bn1, object *bn2);
 /* set #25 */
 Object *object_new_rational (void);
 Object *object_fromstr_rational (object *nsrc);
-Object *object_add_rational (object *bn1, object *bn2);
-Object *object_sub_rational (object *bn1, object *bn2);
-Object *object_mul_rational (object *bn1, object *bn2);
-Object *object_pow_rational (object *bn1, object *bn2);
-Object *object_div_rational (object *bn1, object *bn2);
+Object *object_add_rational (object *rat1, object *rat2);
+Object *object_sub_rational (object *rat1, object *rat2);
+Object *object_mul_rational (object *rat1, object *rat2);
+Object *object_pow_rational (object *rat1, object *rat2);
+Object *object_div_rational (object *rat1, object *rat2);
 
 /* set #26 */
-Object *object_new_rational (void);
-Object *object_fromstr_rational (object *nsrc);
-Object *object_add_rational (object *bn1, object *bn2);
-Object *object_sub_rational (object *bn1, object *bn2);
-Object *object_mul_rational (object *bn1, object *bn2);
-Object *object_pow_rational (object *bn1, object *bn2);
-Object *object_div_rational (object *bn1, object *bn2);
+Object *object_new_decimal (void);
+Object *object_fromstr_decimal (object *nsrc);
+Object *object_add_decimal (object *dec1, object *dec2);
+Object *object_sub_decimal (object *dec1, object *dec2);
+Object *object_mul_decimal (object *dec1, object *dec2);
+Object *object_pow_decimal (object *dec1, object *dec2);
+Object *object_div_decimal (object *dec1, object *dec2);
 
 /* set #26 */
 Object *object_new_buffer (uint8_t *data, const char *aux);
