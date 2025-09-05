@@ -228,7 +228,7 @@ struct Value
       struct PatternElt
       {
 
-        enum PatternType
+        enum PattType
         {
           PATT_Literal,
           PATT_Class,
@@ -240,7 +240,7 @@ struct Value
           PATT_Frontier,
         } type;
 
-        enum PatternQuantifier
+        enum PattQuant
         {
           PQUANT_Once,
           PQUANT_ZeroOrMore,
@@ -248,10 +248,10 @@ struct Value
           PQUANT_ZeroOrOne,
         } quantifier;
 
-        bool nongreedy;
-        bool inverted;
-        uint8_t literal;
-        uint8_t clsname;
+        bool ngrdy;
+        bool invt;
+        uint8_t lit;
+        uint8_t clsnm;
         uint8_t bitmap[UCHAR_MAX + 1];
       } *elts;
       size_t cntelts, capelts;
@@ -544,9 +544,8 @@ Object *object_getseek_port (Object *port);
 
 /* set #13 */
 Object *object_new_pattern (Object *srcstr);
-void object_addelt_pattern (Object *patt, PatternType type,
-                            PatternQuantifier quant, bool nongreedy,
-                            bool inverted, uint8_t literal, uint8_t clsname,
+void object_addelt_pattern (Object *patt, PattType type, PattQuant quant,
+                            bool ngrdy, bool invt, uint8_t lit, uint8_t clsnm,
                             uint8_t *bitmap);
 Object *object_runmatch_pattern (Object *patt, Object *matchstr);
 
