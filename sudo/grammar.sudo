@@ -1,0 +1,224 @@
+// Symbol Types
+enum SymbolType { TERMINAL, NON_TERMINAL }
+
+// A symbol in the grammar
+struct Symbol {
+    SymbolType type
+    string name
+}
+
+// A production rule: a sequence of symbols and an optional action
+struct Production {
+    list<Symbol> symbols
+    function action // User-defined action to execute when this production is reduced
+}
+
+// A grammar rule: a non-terminal with a list of productions
+struct Rule {
+    string name
+    list<Production> productions
+}
+
+// The grammar itself
+struct Grammar {
+    list<Rule> rules
+    string start_symbol
+}
+
+// Action types for the parsing table
+enum ActionType { SHIFT, REDUCE, ACCEPT, ERROR }
+
+// An action in the parsing table
+struct Action {
+    ActionType type
+    int state_or_rule_index // For SHIFT: next state; for REDUCE: rule index
+}
+
+// Parsing table: action and goto tables
+struct ParsingTable {
+    map<pair<int, Symbol>, Action> action_table
+    map<pair<int, string>, int> goto_table
+}
+
+// Parser state
+struct ParserState {
+    stack<int> state_stack
+    stack<any> value_stack // Stack for semantic values
+}
+
+struct LR1Item {
+    int rule_index
+    int production_index
+    int dot_position
+    Symbol lookahead
+}
+
+function items_equal(LR1Item a, LR1Item b) {
+    return a.rule_index == b.rule_index &&
+           a.production_index == b.production_index &&
+           a.dot_position == b.dot_position &&
+           a.lookahead.name == b.lookahead.name
+}
+
+function closure(set<LR1Item> items, Grammar grammar) {
+    set<LR1Item> closure_set = items
+    bool changed = true
+    while (changed) {
+        changed = false
+        for each item in closure_set {
+            if (item.dot_position < item.production.symbols.size()) {
+                Symbol next_symbol = item.production.symbols[item.dot_position]
+                if (next_symbol.type == NON_TERMINAL) {
+                    for each rule in grammar.rules {
+                        if (rule.name == next_symbol.name) {
+                            for each production in rule.productions {
+                                // Compute lookahead for new items
+                                set<Symbol> lookahead_set = compute_lookahead(item, next_symbol, grammar)
+                                for each terminal in lookahead_set {
+                                    LR1Item new_item = {rule.index, production.index, 0, terminal}
+                                    if (new_item not in closure_set) {
+                                        closure_set.add(new_item)
+                                        changed = true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return closure_set
+}
+
+
+function goto(set<LR1Item> items, Symbol symbol, Grammar grammar) {
+    set<LR1Item> goto_set
+    for each item in items {
+        if (item.dot_position < item.production.symbols.size() &&
+            item.production.symbols[item.dot_position].name == symbol.name) {
+            LR1Item moved_item = item
+            moved_item.dot_position++
+            goto_set.add(moved_item)
+        }
+    }
+    return closure(goto_set, grammar)
+}
+
+function construct_canonical_collection(Grammar grammar) {
+    list<set<LR1Item>> collection
+    set<Symbol> start_lookahead = { Symbol(TERMINAL, "$") }
+    LR1Item start_item = {0, 0, 0, Symbol(TERMINAL, "$")} // Assuming start rule is first
+    set<LR1Item> start_set = closure({start_item}, grammar)
+    collection.add(start_set)
+
+    bool changed = true
+    while (changed) {
+        changed = false
+        for each set in collection {
+            for each symbol in grammar.terminals_and_non_terminals {
+                set<LR1Item> goto_set = goto(set, symbol, grammar)
+                if (goto_set is not empty and goto_set not in collection) {
+                    collection.add(goto_set)
+                    changed = true
+                }
+            }
+        }
+    }
+    return collection
+}
+
+function merge_to_lalr(list<set<LR1Item>> canonical_collection) {
+    list<set<LR1Item>> lalr_collection
+    map<set<pair<int, int, int>>, list<int>> core_to_sets
+
+    for i = 0 to canonical_collection.size() - 1 {
+        set<pair<int, int, int>> core
+        for each item in canonical_collection[i] {
+            core.add({item.rule_index, item.production_index, item.dot_position})
+        }
+        if (core not in core_to_sets) {
+            core_to_sets[core] = {}
+        }
+        core_to_sets[core].add(i)
+    }
+
+    for each entry in core_to_sets {
+        set<LR1Item> merged_set
+        for each index in entry.value {
+            for each item in canonical_collection[index] {
+                merged_set.add(item) // Merge lookaheads
+            }
+        }
+        lalr_collection.add(merged_set)
+    }
+    return lalr_collection
+}
+
+function build_parsing_table(list<set<LR1Item>> lalr_collection, Grammar grammar) {
+    ParsingTable table
+
+    for i = 0 to lalr_collection.size() - 1 {
+        set<LR1Item> state = lalr_collection[i]
+        for each item in state {
+            if (item.dot_position < item.production.symbols.size()) {
+                Symbol symbol = item.production.symbols[item.dot_position]
+                set<LR1Item> goto_set = goto(state, symbol, grammar)
+                int j = find_index_of_set(lalr_collection, goto_set)
+                if (symbol.type == TERMINAL) {
+                    table.action_table[{i, symbol}] = Action(SHIFT, j)
+                } else {
+                    table.goto_table[{i, symbol.name}] = j
+                }
+            } else {
+                if (item.rule_index == 0 && item.production_index == 0) { // Start rule
+                    table.action_table[{i, Symbol(TERMINAL, "$")}] = Action(ACCEPT, 0)
+                } else {
+                    table.action_table[{i, item.lookahead}] = Action(REDUCE, item.rule_index)
+                }
+            }
+        }
+    }
+    return table
+}
+
+function parse(ParserState state, ParsingTable table, list<Symbol> input, Grammar grammar) {
+    int current_position = 0
+    state.state_stack.push(0) // Initial state
+
+    while (true) {
+        int current_state = state.state_stack.top()
+        Symbol current_symbol = input[current_position]
+        Action action = table.action_table[{current_state, current_symbol}]
+
+        if (action.type == SHIFT) {
+            state.state_stack.push(action.state_or_rule_index)
+            state.value_stack.push(current_symbol) // Push semantic value
+            current_position++
+        } else if (action.type == REDUCE) {
+            Rule rule = grammar.rules[action.state_or_rule_index]
+            Production production = rule.productions[0] // Assuming single production for simplicity
+
+            // Pop symbols from stack
+            for i = 0 to production.symbols.size() - 1 {
+                state.state_stack.pop()
+                state.value_stack.pop()
+            }
+
+            // Execute action
+            any result = production.action(state.value_stack)
+
+            // Goto
+            int previous_state = state.state_stack.top()
+            int next_state = table.goto_table[{previous_state, rule.name}]
+            state.state_stack.push(next_state)
+            state.value_stack.push(result)
+        } else if (action.type == ACCEPT) {
+            return state.value_stack.top() // Final result
+        } else {
+            error("Parse error at position " + current_position)
+        }
+    }
+}
+
+
