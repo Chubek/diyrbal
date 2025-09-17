@@ -1,0 +1,125 @@
+// Global structures
+global trace_id_counter = 0
+global trace_map = {}            // trace_id -> TraceRecord
+global hot_loop_threshold = 100  // executions before tracing
+global loop_counter = {}         // bytecode offset -> count
+global active_trace = null       // current trace being recorded
+global trace_compiled = {}       // trace_id -> compiled_code
+global runtime_profile = {}      // for CCT (Calling Context Tree)
+
+// TraceRecord structure
+struct TraceRecord:
+    id: int
+    start_pc: int
+    instructions: list<Bytecode>
+    guards: list<Guard>
+    compiled: bool
+
+// Guard structure
+struct Guard:
+    condition: Condition
+    fallback_pc: int
+
+// CCT node
+struct CCTNode:
+    method_name: string
+    call_site: string
+    children: map<string, CCTNode>
+    hit_count: int
+
+function run_interpreter(bytecode_program):
+    pc = 0
+    while pc < len(bytecode_program):
+        instruction = bytecode_program[pc]
+
+        // Stack trace sampling (inspired by paper)
+        if should_sample():
+            sample_stack_trace()
+
+        // Trace recording logic
+        if active_trace != null:
+            record_trace_step(pc, instruction)
+
+        // Hot loop detection
+        if is_loop_header(pc):
+            loop_counter[pc] += 1
+            if loop_counter[pc] >= hot_loop_threshold and active_trace == null:
+                start_trace_recording(pc)
+
+        // Execute instruction
+        execute_instruction(instruction)
+        pc += instruction.size
+
+function start_trace_recording(start_pc):
+    active_trace = TraceRecord(
+        id = trace_id_counter++,
+        start_pc = start_pc,
+        instructions = [],
+        guards = [],
+        compiled = false
+    )
+
+function record_trace_step(pc, instruction):
+    active_trace.instructions.append(instruction)
+
+    // Add guards for branches, type checks, etc.
+    if instruction.is_branch():
+        guard = create_guard(instruction.condition, fallback_pc = instruction.false_target)
+        active_trace.guards.append(guard)
+
+function stop_trace_recording():
+    trace_map[active_trace.id] = active_trace
+    compile_trace(active_trace)
+    active_trace = null
+
+function compile_trace(trace: TraceRecord):
+    optimized_ir = optimize(trace.instructions)
+    machine_code = backend_compile(optimized_ir, trace.guards)
+    trace_compiled[trace.id] = machine_code
+    trace.compiled = true
+
+function handle_guard_failure(guard: Guard):
+    // Deoptimize and return to interpreter
+    invalidate_trace(active_trace.id)
+    jump_to_interpreter(guard.fallback_pc)
+
+function should_sample():
+    // e.g., probabilistic sampling or timer-based
+    return random() < 0.01
+
+function sample_stack_trace():
+    stack_snapshot = get_current_stack()
+    call_trace = decode_stack_to_call_trace(stack_snapshot)
+    merge_into_cct(call_trace, runtime_profile)
+
+function merge_into_cct(call_trace: list<string>, cct_root: CCTNode):
+    node = cct_root
+    for method in call_trace:
+        if method not in node.children:
+            node.children[method] = CCTNode(method, hit_count = 0)
+        node = node.children[method]
+        node.hit_count += 1
+
+function is_loop_header(pc):
+    // Detect if current PC is a loop back-edge
+    return bytecode_program[pc].is_jump_back()
+
+function execute_instruction(instruction):
+    switch instruction.opcode:
+        case ADD: ...
+        case LOAD: ...
+        case CALL: ...
+        // etc.
+
+function create_guard(condition, fallback_pc):
+    return Guard(condition = condition, fallback_pc = fallback_pc)
+
+function optimize(instructions):
+    // Apply optimizations like constant folding, dead code elimination
+    return optimized_instructions
+
+function backend_compile(ir, guards):
+    // Emit optimized machine code with guard checks
+    return machine_code
+
+
