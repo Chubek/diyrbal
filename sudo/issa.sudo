@@ -1,0 +1,300 @@
+// Basic value type that can hold integers, booleans, array references, etc.
+STRUCTURE Value:
+    ValueType type          // INT, BOOL, ARRAY_REF, etc.
+    union data:
+        int int_val
+        bool bool_val
+        int array_ref       // Index into array_versions table
+    END union
+END STRUCTURE
+
+// Represents a single ISSA instruction
+STRUCTURE Instruction:
+    Opcode opcode          // CONST, ADD, PHI, ASTORE, etc.
+    Value[] operands       // List of operands
+    int target_addr        // For branches/jumps - target instruction number
+    int cen_value         // CEN value to set for control flow
+END STRUCTURE
+
+// Sparse array node for efficient array representation
+STRUCTURE SparseArrayNode:
+    int index             // Array index that was modified
+    Value value           // Value stored at that index
+    int instruction_num   // Instruction that created this modification
+    SparseArrayNode* next // Next modification in chain
+END STRUCTURE
+
+// Sparse array version
+STRUCTURE SparseArray:
+    int base_instruction  // Instruction that created base array
+    int size             // Array size
+    SparseArrayNode* modifications  // Chain of modifications
+END STRUCTURE
+
+// Entry in the PHI buffer for deferred execution
+STRUCTURE PhiEntry:
+    int target_instruction  // Instruction number that will receive result
+    Value selected_value   // Value selected by PHI function
+END STRUCTURE
+
+// Buffer for collecting PHI operations before commit
+STRUCTURE PhiSet:
+    PhiEntry[] entries
+    int count
+END STRUCTURE
+
+// Complete VM state
+STRUCTURE VMState:
+    // Program and execution state
+    Instruction[] program
+    int program_counter
+    boolean halted
+    
+    // Register file - indexed by instruction number
+    Value[] instruction_results
+    
+    // Control flow state
+    int CEN  // CFG-Edge Number register
+    
+    // PHI function management
+    PhiSet phi_buffer
+    
+    // Array management
+    SparseArray[] array_versions  // All array versions
+    int next_array_id
+END STRUCTURE
+
+FUNCTION initialize_vm(program):
+    VMState vm = new VMState()
+    vm.program = program
+    vm.program_counter = 0
+    vm.halted = FALSE
+    vm.CEN = 0
+    vm.phi_buffer.count = 0
+    vm.next_array_id = 0
+    
+    // Initialize instruction results array
+    vm.instruction_results = new Value[program.length]
+    vm.array_versions = new SparseArray[MAX_ARRAYS]
+    
+    RETURN vm
+END FUNCTION
+
+FUNCTION fetch_instruction(vm):
+    IF vm.program_counter >= vm.program.length THEN
+        RETURN NULL  // End of program
+    END IF
+    RETURN vm.program[vm.program_counter]
+END FUNCTION
+
+FUNCTION get_operand_value(operand, vm):
+    SWITCH operand.type:
+        CASE IMMEDIATE:
+            RETURN operand  // Direct value
+        CASE INSTRUCTION_REF:
+            // Get value produced by referenced instruction
+            RETURN vm.instruction_results[operand.data.int_val]
+        CASE ARRAY_REF:
+            RETURN operand  // Array reference passed as-is
+    END SWITCH
+END FUNCTION
+
+FUNCTION execute_instruction(instruction, vm):
+    old_pc = vm.program_counter  // Save for increment logic
+    
+    SWITCH instruction.opcode:
+        CASE CONST:
+            // Store immediate value as result of this instruction
+            vm.instruction_results[vm.program_counter] = instruction.operands[0]
+            
+        CASE ADD:
+            val1 = get_operand_value(instruction.operands[0], vm)
+            val2 = get_operand_value(instruction.operands[1], vm)
+            result = new Value(INT, val1.data.int_val + val2.data.int_val)
+            vm.instruction_results[vm.program_counter] = result
+            
+        CASE SUB:
+            val1 = get_operand_value(instruction.operands[0], vm)
+            val2 = get_operand_value(instruction.operands[1], vm)
+            result = new Value(INT, val1.data.int_val - val2.data.int_val)
+            vm.instruction_results[vm.program_counter] = result
+            
+        CASE MUL:
+            val1 = get_operand_value(instruction.operands[0], vm)
+            val2 = get_operand_value(instruction.operands[1], vm)
+            result = new Value(INT, val1.data.int_val * val2.data.int_val)
+            vm.instruction_results[vm.program_counter] = result
+            
+        CASE PHI:
+            // Select operand based on CEN register
+            operand_index = vm.CEN
+            IF operand_index >= instruction.operands.length THEN
+                ERROR "PHI: CEN value out of range"
+            END IF
+            
+            selected_value = get_operand_value(instruction.operands[operand_index], vm)
+            
+            // Add to PHI buffer instead of immediately storing
+            entry = new PhiEntry()
+            entry.target_instruction = vm.program_counter
+            entry.selected_value = selected_value
+            vm.phi_buffer.entries[vm.phi_buffer.count] = entry
+            vm.phi_buffer.count++
+            
+        CASE PFE:  // Phi Function End - commit all buffered PHI operations
+            FOR i = 0 TO vm.phi_buffer.count - 1:
+                entry = vm.phi_buffer.entries[i]
+                vm.instruction_results[entry.target_instruction] = entry.selected_value
+            END FOR
+            
+            // Clear PHI buffer and reset CEN
+            vm.phi_buffer.count = 0
+            vm.CEN = 0
+            
+        CASE BEQ:  // Branch if equal
+            val1 = get_operand_value(instruction.operands[0], vm)
+            val2 = get_operand_value(instruction.operands[1], vm)
+            
+            IF val1.data.int_val == val2.data.int_val THEN
+                vm.CEN = instruction.cen_value
+                vm.program_counter = instruction.target_addr
+                RETURN  // Skip normal PC increment
+            END IF
+            
+        CASE BLE:  // Branch if less than or equal
+            val1 = get_operand_value(instruction.operands[0], vm)
+            val2 = get_operand_value(instruction.operands[1], vm)
+            
+            IF val1.data.int_val <= val2.data.int_val THEN
+                vm.CEN = instruction.cen_value
+                vm.program_counter = instruction.target_addr
+                RETURN  // Skip normal PC increment
+            END IF
+            
+        CASE GOTO:
+            vm.CEN = instruction.cen_value
+            vm.program_counter = instruction.target_addr
+            RETURN  // Skip normal PC increment
+            
+        CASE NEW_ARRAY:
+            size_val = get_operand_value(instruction.operands[0], vm)
+            
+            // Create new sparse array
+            new_array = new SparseArray()
+            new_array.base_instruction = vm.program_counter
+            new_array.size = size_val.data.int_val
+            new_array.modifications = NULL
+            
+            // Store in array versions table
+            array_id = vm.next_array_id++
+            vm.array_versions[array_id] = new_array
+            
+            // Return array reference
+            result = new Value(ARRAY_REF, array_id)
+            vm.instruction_results[vm.program_counter] = result
+            
+        CASE ASTORE:  // Array store - creates new array version
+            array_ref = get_operand_value(instruction.operands[0], vm)
+            index_val = get_operand_value(instruction.operands[1], vm)
+            store_val = get_operand_value(instruction.operands[2], vm)
+            
+            // Get source array
+            source_array = vm.array_versions[array_ref.data.array_ref]
+            
+            // Create new array version with modification
+            new_array = sparse_array_store(source_array, 
+                                         index_val.data.int_val, 
+                                         store_val,
+                                         vm.program_counter)
+            
+            // Store new version
+            new_array_id = vm.next_array_id++
+            vm.array_versions[new_array_id] = new_array
+            
+            // Return reference to new version
+            result = new Value(ARRAY_REF, new_array_id)
+            vm.instruction_results[vm.program_counter] = result
+            
+        CASE ALOAD:  // Array load
+            array_ref = get_operand_value(instruction.operands[0], vm)
+            index_val = get_operand_value(instruction.operands[1], vm)
+            
+            // Get array and load value
+            array = vm.array_versions[array_ref.data.array_ref]
+            loaded_val = sparse_array_load(array, index_val.data.int_val)
+            
+            vm.instruction_results[vm.program_counter] = loaded_val
+            
+        CASE PRINT:
+            val = get_operand_value(instruction.operands[0], vm)
+            PRINT val.data.int_val
+            
+        CASE HALT:
+            vm.halted = TRUE
+            RETURN
+            
+        DEFAULT:
+            ERROR "Unknown instruction: " + instruction.opcode
+    END SWITCH
+    
+    // Normal PC increment (if not modified by branch/jump)
+    IF vm.program_counter == old_pc THEN
+        vm.program_counter++
+    END IF
+END FUNCTION
+
+FUNCTION sparse_array_store(source_array, index, value, instruction_num):
+    // Create new array version
+    new_array = new SparseArray()
+    new_array.base_instruction = source_array.base_instruction
+    new_array.size = source_array.size
+    
+    // Create new modification node
+    new_node = new SparseArrayNode()
+    new_node.index = index
+    new_node.value = value
+    new_node.instruction_number = instruction_num
+    new_node.next = source_array.modifications  // Chain to previous modifications
+    
+    new_array.modifications = new_node
+    RETURN new_array
+END FUNCTION
+
+FUNCTION sparse_array_load(array, index):
+    // Search through modification chain from newest to oldest
+    current = array.modifications
+    WHILE current != NULL:
+        IF current.index == index THEN
+            RETURN current.value  // Found most recent value for this index
+        END IF
+        current = current.next
+    END WHILE
+    
+    // Not found in modifications, return default value (0)
+    RETURN new Value(INT, 0)
+END FUNCTION
+
+FUNCTION run_vm(program):
+    vm = initialize_vm(program)
+    
+    WHILE NOT vm.halted:
+        instruction = fetch_instruction(vm)
+        
+        IF instruction == NULL THEN
+            // Reached end of program without HALT
+            PRINT "Program ended without HALT instruction"
+            BREAK
+        END IF
+        
+        execute_instruction(instruction, vm)
+        
+        // Check for infinite loops or runaway execution
+        IF vm.program_counter < 0 OR vm.program_counter >= program.length THEN
+            ERROR "Program counter out of bounds: " + vm.program_counter
+            BREAK
+        END IF
+    END WHILE
+    
+    PRINT "VM execution completed"
+END FUNCTION
+
