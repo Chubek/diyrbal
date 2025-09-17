@@ -1,0 +1,242 @@
+// --- Core Data Structures ---
+
+// Represents a handle to a GC-managed object for use by external code.
+type Ref {
+    private gc_descriptor: GC_Descriptor // The actual pointer/value tracked by the GC
+    private is_global: Boolean          // Flag to distinguish local from global refs
+    private next_local: Ref?            // Link for local ref chain within CallContext
+}
+
+// Represents the context of a single call from Diyrbal to external code.
+type CallContext {
+    private local_refs_head: Ref?       // Head of the linked list of local refs for this call
+    private previous_context: CallContext? // For nesting calls or thread-local stack
+}
+
+// Abstract interface for interacting with the Diyrbal GC.
+interface GCInterface {
+    // Adds a GC_Descriptor location to the root set.
+    method add_root(location: Pointer<GC_Descriptor>)
+
+    // Removes a GC_Descriptor location from the root set.
+    method remove_root(location: Pointer<GC_Descriptor>)
+
+    // Allocates a new GC-managed object.
+    method allocate_object(type_info: TypeInfo, size: Integer): GC_Descriptor
+
+    // Writes a value to a field of a GC-managed object.
+    method write_field(object: GC_Descriptor, field_offset: Integer, value: GC_Descriptor)
+
+    // Reads a value from a field of a GC-managed object.
+    method read_field(object: GC_Descriptor, field_offset: Integer): GC_Descriptor
+}
+
+// --- FFI Core Module ---
+
+module FFI_Core {
+    // Assume a thread-local storage mechanism exists.
+    private thread_local current_call_context: CallContext?
+
+    // Assume access to the VM's GC interface.
+    private gc_interface: GCInterface
+
+    // Initializes the FFI for a thread.
+    procedure initialize_thread() {
+        current_call_context = null
+    }
+
+    // Cleans up the FFI for a thread.
+    procedure cleanup_thread() {
+        // Assert: current_call_context should be null at thread exit
+        if (current_call_context != null) {
+            error("FFI: Thread exited with active call context")
+        }
+    }
+
+    // --- Reference Management ---
+
+    // Wraps a GC_Descriptor in a local Ref for the current call.
+    function wrap_local(gc_obj: GC_Descriptor): Ref {
+        if (current_call_context == null) {
+            error("FFI: Cannot create local ref outside of a call context")
+        }
+        let ref: Ref = allocate_memory(sizeof(Ref))
+        ref.gc_descriptor = gc_obj
+        ref.is_global = false
+        // Add to the head of the local ref list for this call
+        ref.next_local = current_call_context.local_refs_head
+        current_call_context.local_refs_head = ref
+
+        // Register the ref's descriptor with the GC as a root
+        gc_interface.add_root(address_of(ref.gc_descriptor))
+        return ref
+    }
+
+    // Promotes a local Ref to a global Ref.
+    function make_global(local_ref: Ref): Ref {
+        if (local_ref.is_global) {
+            error("FFI: Cannot make a global ref global again")
+        }
+        let global_ref: Ref = allocate_memory(sizeof(Ref))
+        global_ref.gc_descriptor = local_ref.gc_descriptor
+        global_ref.is_global = true
+        global_ref.next_local = null // Not used for global refs
+
+        // The descriptor is already registered via the local ref.
+        // No need to re-register, but the global ref now holds the descriptor live.
+        return global_ref
+    }
+
+    // Frees a global Ref.
+    procedure free_global(global_ref: Ref) {
+        if (!global_ref.is_global) {
+            error("FFI: Cannot free a local ref with free_global")
+        }
+        // Unregister the descriptor from the GC root set
+        gc_interface.remove_root(address_of(global_ref.gc_descriptor))
+        free_memory(global_ref)
+    }
+
+    // --- Call Context Management ---
+
+    // Called by the VM before entering external code.
+    function enter_external_call(): CallContext {
+        let new_context: CallContext = allocate_memory(sizeof(CallContext))
+        new_context.local_refs_head = null
+        new_context.previous_context = current_call_context
+        current_call_context = new_context
+        return new_context
+    }
+
+    // Called by the VM after returning from external code.
+    procedure exit_external_call(context: CallContext) {
+        if (current_call_context != context) {
+            error("FFI: Mismatched call context on exit")
+        }
+
+        // Automatically free all local references created during this call
+        let current_ref: Ref? = context.local_refs_head
+        while (current_ref != null) {
+            let next_ref: Ref? = current_ref.next_local
+            // Unregister the descriptor from the GC root set
+            gc_interface.remove_root(address_of(current_ref.gc_descriptor))
+            free_memory(current_ref)
+            current_ref = next_ref
+        }
+
+        // Restore the previous call context
+        current_call_context = context.previous_context
+        free_memory(context)
+    }
+
+    // --- Utility Functions for External Code ---
+
+    // Example: Allocate a new pair (cons cell) in the Diyrbal heap.
+    function allocate_pair(call_ctx: CallContext): Ref {
+        let gc_pair: GC_Descriptor = gc_interface.allocate_object(TYPE_PAIR, size_of_pair())
+        // Wrap the newly allocated object in a local ref
+        return wrap_local(gc_pair)
+    }
+
+    // Example: Set the 'car' field of a pair.
+    procedure set_car(pair_ref: Ref, value_ref: Ref) {
+        // Assume field offsets are known constants
+        gc_interface.write_field(pair_ref.gc_descriptor, OFFSET_CAR, value_ref.gc_descriptor)
+    }
+
+    // Example: Get the 'car' field of a pair.
+    function get_car(pair_ref: Ref): Ref {
+         let gc_car_value: GC_Descriptor = gc_interface.read_field(pair_ref.gc_descriptor, OFFSET_CAR)
+         // Wrap the retrieved value in a new local ref for the current call
+         return wrap_local(gc_car_value)
+    }
+
+    // Example: Free a local reference explicitly (optional, for optimization).
+    procedure free_local(local_ref: Ref) {
+        if (local_ref.is_global) {
+             error("FFI: Cannot free a global ref with free_local")
+        }
+        // This is a simplified model. A full implementation would need to
+        // remove the ref from the call context's linked list and then
+        // unregister and free it, which is complex. The auto-cleanup
+        // on call exit is the primary mechanism.
+        // For simplicity here, we just unregister it.
+        gc_interface.remove_root(address_of(local_ref.gc_descriptor))
+        // Note: In a real system, removing from the list is also necessary.
+    }
+}
+
+// --- VM Integration Example (Pseudo) ---
+
+// This is how the Diyrbal VM might call an external function.
+function vm_call_external_function(external_func_ptr: Pointer<Function>, args: List<GC_Descriptor>): GC_Descriptor {
+    // 1. Prepare arguments: Wrap GC_Descriptors in Refs
+    let wrapped_args: List<Ref> = []
+    for (gc_arg in args) {
+        append(wrapped_args, FFI_Core.wrap_local(gc_arg))
+    }
+
+    // 2. Enter FFI call context
+    let call_ctx: CallContext = FFI_Core.enter_external_call()
+
+    // 3. Perform the actual call (this is where external C code runs)
+    //    The external function receives `call_ctx` and `wrapped_args`.
+    let result_ref: Ref = external_func_ptr(call_ctx, wrapped_args) // Simplified signature
+
+    // 4. Exit FFI call context (frees local refs)
+    FFI_Core.exit_external_call(call_ctx)
+
+    // 5. Return result to VM (unwrap the Ref)
+    return result_ref.gc_descriptor
+}
+
+// --- Example External Code (C-like Pseudo) ---
+
+// This represents code that would be written by a Diyrbal programmer
+// to interface with C libraries.
+
+function my_external_cons_function(call_ctx: CallContext, args: List<Ref>): Ref {
+    // Assume args[0] and args[1] are the car and cdr values (as Refs)
+    let car_ref: Ref = args[0]
+    let cdr_ref: Ref = args[1]
+
+    // Allocate a new pair in the Diyrbal heap
+    let new_pair_ref: Ref = FFI_Core.allocate_pair(call_ctx)
+
+    // Set the fields of the new pair
+    FFI_Core.set_car(new_pair_ref, car_ref)
+    // Assume a similar set_cdr function exists
+    FFI_Core.set_cdr(new_pair_ref, cdr_ref) // Implementation not shown, but similar to set_car
+
+    // Return the new pair as a Ref
+    return new_pair_ref
+}
+
+// Example of using global references
+function my_external_store_global_function(call_ctx: CallContext, args: List<Ref>): Ref {
+     let obj_to_store_ref: Ref = args[0] // A local ref passed in
+
+     // Promote the local ref to a global ref so it can be stored
+     let global_ref: Ref = FFI_Core.make_global(obj_to_store_ref)
+
+     // Store the global ref somewhere (e.g., a global variable in C)
+     my_global_storage = global_ref // Assume my_global_storage is a C global variable of type Ref
+
+     // Return a status or null/void ref
+     return FFI_Core.wrap_local(some_void_or_status_gc_descriptor) // Simplified
+}
+
+function my_external_cleanup_global_function(call_ctx: CallContext, args: List<Ref>): Ref {
+     // Retrieve the global ref (e.g., from a global variable)
+     let global_ref_to_free: Ref = my_global_storage // Assume my_global_storage holds the Ref
+
+     // Free the global ref
+     FFI_Core.free_global(global_ref_to_free)
+
+     // Clear the storage
+     my_global_storage = null
+
+     // Return a status or null/void ref
+     return FFI_Core.wrap_local(some_void_or_status_gc_descriptor) // Simplified
+}
+
