@@ -1,0 +1,578 @@
+// Main components of our green thread system
+module GreenThreads {
+    // Process control block
+    struct Process {
+        pid: ProcessID,
+        state: ProcessState,
+        stack: Stack,
+        mailbox: Queue<Message>,
+        links: Set<ProcessID>,
+        monitors: Map<ProcessID, MonitorRef>,
+        trap_exit: Boolean,
+        priority: Priority,
+        reductions: Integer,  // Work units for scheduling
+        heap: Heap,
+        registers: Array<Register>
+    }
+    
+    // Scheduler maintains run queue and manages execution
+    struct Scheduler {
+        run_queue: PriorityQueue<Process>,
+        active_processes: Map<ProcessID, Process>,
+        current_process: Process,
+        scheduler_id: Integer
+    }
+    
+    // Message passing system
+    struct Message {
+        sender: ProcessID,
+        content: Any,
+        timestamp: Timestamp
+    }
+}
+
+module ProcessManager {
+    // Global process registry
+    global process_table: Map<ProcessID, Process> = {}
+    global registered_names: Map<String, ProcessID> = {}
+    global next_pid: ProcessID = 1
+    
+    // Create a new process
+    function spawn(entry_point: Function, args: List<Any>): ProcessID {
+        // Allocate new process ID
+        pid := next_pid
+        next_pid := next_pid + 1
+        
+        // Initialize process control block
+        process := Process {
+            pid: pid,
+            state: READY,
+            stack: Stack.new(),
+            mailbox: Queue.new(),
+            links: Set.new(),
+            monitors: Map.new(),
+            trap_exit: false,
+            priority: NORMAL,
+            reductions: 0,
+            heap: Heap.new(INITIAL_HEAP_SIZE),
+            registers: Array.new(NUM_REGISTERS)
+        }
+        
+        // Set up initial execution context
+        setup_initial_context(process, entry_point, args)
+        
+        // Add to process table
+        process_table[pid] := process
+        
+        // Add to scheduler run queue
+        scheduler.add_to_run_queue(process)
+        
+        return pid
+    }
+    
+    // Set up initial execution context for a process
+    function setup_initial_context(process: Process, entry_point: Function, args: List<Any>) {
+        // Create initial stack frame
+        frame := StackFrame {
+            function: entry_point,
+            arguments: args,
+            return_address: null,  // No return for top-level functions
+            local_variables: Map.new()
+        }
+        
+        process.stack.push(frame)
+    }
+    
+    // Register a process with a name
+    function register_name(name: String, pid: ProcessID): Boolean {
+        if name in registered_names {
+            return false  // Name already taken
+        }
+        
+        registered_names[name] := pid
+        return true
+    }
+    
+    // Find process by registered name
+    function whereis(name: String): ProcessID? {
+        return registered_names.get(name, null)
+    }
+    
+    // Terminate a process
+    function exit_process(pid: ProcessID, reason: Any) {
+        process := process_table.get(pid, null)
+        if process == null {
+            return  // Process already gone
+        }
+        
+        // Handle linked processes
+        for linked_pid in process.links {
+            linked_process := process_table.get(linked_pid, null)
+            if linked_process != null && linked_process.trap_exit {
+                // Send exit message instead of killing
+                send_message(linked_pid, Message {
+                    sender: pid,
+                    content: {'EXIT', pid, reason},
+                    timestamp: current_time()
+                })
+            } else if linked_process != null {
+                // Kill linked process too
+                exit_process(linked_pid, reason)
+            }
+        }
+        
+        // Handle monitored processes
+        for monitored_pid, ref in process.monitors {
+            monitored_process := process_table.get(monitored_pid, null)
+            if monitored_process != null {
+                send_message(monitored_pid, Message {
+                    sender: pid,
+                    content: {'DOWN', ref, 'process', pid, reason},
+                    timestamp: current_time()
+                })
+            }
+        }
+        
+        // Clean up process resources
+        cleanup_process_resources(process)
+        
+        // Remove from process table
+        process_table.remove(pid)
+        
+        // Remove from registered names
+        for name, registered_pid in registered_names {
+            if registered_pid == pid {
+                registered_names.remove(name)
+                break
+            }
+        }
+    }
+    
+    // Clean up process resources
+    function cleanup_process_resources(process: Process) {
+        // Free heap memory
+        process.heap.destroy()
+        
+        // Clear mailbox
+        while not process.mailbox.empty() {
+            process.mailbox.pop()
+        }
+        
+        // Clear stack
+        while not process.stack.empty() {
+            process.stack.pop()
+        }
+    }
+}
+
+module Scheduler {
+    // Multiple schedulers for SMP systems
+    global schedulers: List<Scheduler> = []
+    global num_schedulers: Integer = NUM_CORES
+    
+    // Initialize scheduler system
+    function init() {
+        for i in 0..num_schedulers-1 {
+            schedulers.append(Scheduler {
+                run_queue: PriorityQueue.new(),
+                active_processes: Map.new(),
+                current_process: null,
+                scheduler_id: i
+            })
+        }
+    }
+    
+    // Add process to run queue
+    function add_to_run_queue(process: Process) {
+        // Simple round-robin assignment to schedulers
+        scheduler_id := process.pid % num_schedulers
+        schedulers[scheduler_id].run_queue.push(process, process.priority)
+        schedulers[scheduler_id].active_processes[process.pid] := process
+    }
+    
+    // Main scheduling loop
+    function run() {
+        // In a real implementation, this would run on multiple threads
+        for scheduler in schedulers {
+            run_scheduler(scheduler)
+        }
+    }
+    
+    // Run a single scheduler
+    function run_scheduler(scheduler: Scheduler) {
+        while true {
+            // Get next process to run
+            if scheduler.run_queue.empty() {
+                // No processes to run, sleep briefly
+                sleep(SCHEDULER_SLEEP_TIME)
+                continue
+            }
+            
+            process := scheduler.run_queue.pop()
+            scheduler.current_process := process
+            
+            // Execute process for a time slice
+            execute_process_slice(process)
+            
+            // If process is still alive and ready, put it back in run queue
+            if process.state == READY {
+                scheduler.run_queue.push(process, process.priority)
+            } else if process.state == WAITING {
+                // Process is waiting for something, don't reschedule yet
+                // It will be rescheduled when whatever it's waiting for happens
+            } else if process.state == TERMINATED {
+                // Process has finished, clean it up
+                ProcessManager.exit_process(process.pid, NORMAL)
+            }
+        }
+    }
+    
+    // Execute a process for one time slice
+    function execute_process_slice(process: Process) {
+        reductions := 0
+        max_reductions := TIME_SLICE_REDUCTIONS
+        
+        while reductions < max_reductions and process.state == READY {
+            // Execute one instruction
+            result := execute_instruction(process)
+            
+            reductions := reductions + 1
+            process.reductions := process.reductions + 1
+            
+            // Check for errors
+            if result.type == ERROR {
+                handle_process_error(process, result.error)
+                break
+            }
+            
+            // Check if process has yielded
+            if process.state != READY {
+                break
+            }
+        }
+    }
+    
+    // Execute a single instruction
+    function execute_instruction(process: Process): ExecutionResult {
+        // Get current stack frame
+        frame := process.stack.top()
+        
+        // Get next instruction
+        instruction := get_next_instruction(frame)
+        
+        // Execute based on instruction type
+        switch instruction.type {
+            case SPAWN:
+                return execute_spawn(process, instruction)
+            case SEND:
+                return execute_send(process, instruction)
+            case RECEIVE:
+                return execute_receive(process, instruction)
+            case LINK:
+                return execute_link(process, instruction)
+            case EXIT:
+                return execute_exit(process, instruction)
+            // ... other instructions
+            default:
+                return ExecutionResult { type: ERROR, error: UNKNOWN_INSTRUCTION }
+        }
+    }
+}
+
+module MessagePassing {
+    // Send a message to a process
+    function send_message(to_pid: ProcessID, message: Message): Boolean {
+        process := ProcessManager.process_table.get(to_pid, null)
+        if process == null {
+            return false  // Process doesn't exist
+        }
+        
+        // Add message to process mailbox
+        process.mailbox.push(message)
+        
+        // If process was waiting for messages, wake it up
+        if process.state == WAITING and is_waiting_for_message(process) {
+            process.state := READY
+            Scheduler.add_to_run_queue(process)
+        }
+        
+        return true
+    }
+    
+    // Receive messages with pattern matching
+    function receive_message(process: Process, patterns: List<Pattern>, timeout: Integer?): Any {
+        start_time := current_time()
+        
+        while true {
+            // Check mailbox for matching message
+            for i := 0; i < process.mailbox.size(); i++ {
+                message := process.mailbox.get(i)
+                
+                // Try to match against patterns
+                for pattern in patterns {
+                    match_result := pattern_match(message.content, pattern)
+                    if match_result.matched {
+                        // Remove message from mailbox
+                        process.mailbox.remove(i)
+                        
+                        // Return matched value
+                        return match_result.bindings
+                    }
+                }
+            }
+            
+            // No matching message found
+            if timeout != null {
+                elapsed := current_time() - start_time
+                if elapsed >= timeout {
+                    return TIMEOUT
+                }
+            }
+            
+            // Wait for messages
+            process.state := WAITING
+            yield()  // Yield control to scheduler
+        }
+    }
+    
+    // Pattern matching engine
+    function pattern_match(value: Any, pattern: Pattern): MatchResult {
+        switch pattern.type {
+            case ATOM:
+                if value.type == ATOM and value.value == pattern.value {
+                    return MatchResult { matched: true, bindings: {} }
+                }
+            case VARIABLE:
+                bindings := Map.new()
+                bindings[pattern.name] := value
+                return MatchResult { matched: true, bindings: bindings }
+            case TUPLE:
+                if value.type == TUPLE and value.elements.size() == pattern.elements.size() {
+                    bindings := Map.new()
+                    for i := 0; i < pattern.elements.size(); i++ {
+                        result := pattern_match(value.elements[i], pattern.elements[i])
+                        if not result.matched {
+                            return MatchResult { matched: false, bindings: {} }
+                        }
+                        bindings.merge(result.bindings)
+                    }
+                    return MatchResult { matched: true, bindings: bindings }
+                }
+            // ... other pattern types
+        }
+        
+        return MatchResult { matched: false, bindings: {} }
+    }
+}
+
+module ProcessLinks {
+    // Link two processes together
+    function link_processes(pid1: ProcessID, pid2: ProcessID): Boolean {
+        process1 := ProcessManager.process_table.get(pid1, null)
+        process2 := ProcessManager.process_table.get(pid2, null)
+        
+        if process1 == null or process2 == null {
+            return false
+        }
+        
+        process1.links.add(pid2)
+        process2.links.add(pid1)
+        
+        return true
+    }
+    
+    // Unlink two processes
+    function unlink_processes(pid1: ProcessID, pid2: ProcessID): Boolean {
+        process1 := ProcessManager.process_table.get(pid1, null)
+        process2 := ProcessManager.process_table.get(pid2, null)
+        
+        if process1 == null or process2 == null {
+            return false
+        }
+        
+        process1.links.remove(pid2)
+        process2.links.remove(pid1)
+        
+        return true
+    }
+    
+    // Monitor a process
+    function monitor_process(monitoring_pid: ProcessID, target_pid: ProcessID): MonitorRef {
+        process := ProcessManager.process_table.get(target_pid, null)
+        if process == null {
+            // Send DOWN message immediately since process is gone
+            MessagePassing.send_message(monitoring_pid, Message {
+                sender: SYSTEM,
+                content: {'DOWN', ref, 'process', target_pid, NOPROC},
+                timestamp: current_time()
+            })
+            return ref
+        }
+        
+        ref := generate_monitor_ref()
+        process.monitors[monitoring_pid] := ref
+        
+        return ref
+    }
+    
+    // Demonitor a process
+    function demonitor_process(monitoring_pid: ProcessID, target_pid: ProcessID, ref: MonitorRef): Boolean {
+        process := ProcessManager.process_table.get(target_pid, null)
+        if process == null {
+            return false
+        }
+        
+        stored_ref := process.monitors.get(monitoring_pid, null)
+        if stored_ref == ref {
+            process.monitors.remove(monitoring_pid)
+            return true
+        }
+        
+        return false
+    }
+}
+
+module ErrorHandler {
+    // Handle process errors
+    function handle_process_error(process: Process, error: Error) {
+        // Check if process is trapping exits
+        if process.trap_exit {
+            // Convert error to message
+            error_message := Message {
+                sender: SYSTEM,
+                content: {'EXIT', error.type, error.reason},
+                timestamp: current_time()
+            }
+            
+            MessagePassing.send_message(process.pid, error_message)
+            process.state := READY
+        } else {
+            // Terminate process
+            process.state := TERMINATED
+            
+            // Notify linked processes
+            for linked_pid in process.links {
+                linked_process := ProcessManager.process_table.get(linked_pid, null)
+                if linked_process != null {
+                    if linked_process.trap_exit {
+                        // Send exit message
+                        MessagePassing.send_message(linked_pid, Message {
+                            sender: process.pid,
+                            content: {'EXIT', process.pid, error.reason},
+                            timestamp: current_time()
+                        })
+                    } else {
+                        // Kill linked process too
+                        ProcessManager.exit_process(linked_pid, error.reason)
+                    }
+                }
+            }
+        }
+    }
+    
+    // Supervisor behavior
+    struct Supervisor {
+        children: List<ChildSpec>,
+        strategy: SupervisionStrategy
+    }
+    
+    struct ChildSpec {
+        id: String,
+        start_func: Function,
+        restart: RestartType,
+        shutdown: ShutdownType,
+        type: ProcessType,
+        modules: List<Module>
+    }
+    
+    // Start a supervisor
+    function start_supervisor(spec: SupervisorSpec): ProcessID {
+        supervisor_func := function() {
+            supervisor_loop(spec)
+        }
+        
+        return ProcessManager.spawn(supervisor_func, [])
+    }
+    
+    // Supervisor main loop
+    function supervisor_loop(spec: SupervisorSpec) {
+        children := Map.new()
+        
+        // Start all children
+        for child_spec in spec.children {
+            pid := start_child(child_spec)
+            children[child_spec.id] := pid
+        }
+        
+        // Handle child termination
+        while true {
+            message := receive(
+                {'EXIT', pid, reason} -> handle_child_exit(pid, reason, spec, children)
+            )
+        }
+    }
+    
+    // Start a child process
+    function start_child(child_spec: ChildSpec): ProcessID {
+        // In a real implementation, this would call the start function
+        // and handle the result appropriately
+        return ProcessManager.spawn(child_spec.start_func, [])
+    }
+    
+    // Handle child process exit
+    function handle_child_exit(pid: ProcessID, reason: Any, spec: SupervisorSpec, children: Map) {
+        // Find which child died
+        child_id := null
+        for id, child_pid in children {
+            if child_pid == pid {
+                child_id := id
+                break
+            }
+        }
+        
+        if child_id == null {
+            return  // Not our child
+        }
+        
+        child_spec := find_child_spec(spec, child_id)
+        
+        // Decide what to do based on supervision strategy
+        switch spec.strategy {
+            case ONE_FOR_ONE:
+                if should_restart_child(child_spec, reason) {
+                    new_pid := start_child(child_spec)
+                    children[child_id] := new_pid
+                }
+            case ONE_FOR_ALL:
+                // Terminate all children
+                for id, child_pid in children {
+                    ProcessManager.exit_process(child_pid, SHUTDOWN)
+                }
+                
+                // Restart all children
+                if should_restart_child(child_spec, reason) {
+                    for child_spec in spec.children {
+                        new_pid := start_child(child_spec)
+                        children[child_spec.id] := new_pid
+                    }
+                }
+            case REST_FOR_ONE:
+                // Terminate and restart children that were started after the dead one
+                // Implementation details omitted for brevity
+        }
+    }
+    
+    // Determine if a child should be restarted
+    function should_restart_child(child_spec: ChildSpec, reason: Any): Boolean {
+        switch child_spec.restart {
+            case PERMANENT:
+                return true
+            case TRANSIENT:
+                return reason != NORMAL
+            case TEMPORARY:
+                return false
+        }
+    }
+}
+
+
