@@ -1,0 +1,752 @@
+LANGUAGE = "sudolang"
+
+############################################################
+#  DIYRBAL GREEN THREAD SYSTEM                             #
+#  Actor-based concurrency with message passing            #
+############################################################
+
+########################################
+# SECTION 0 — CONSTANTS & CONFIGURATION
+########################################
+
+CONST MAX_THREADS        = 65536        # Maximum concurrent green threads
+CONST DEFAULT_STACK_SIZE = 8192         # Default stack size in Values
+CONST MIN_STACK_SIZE     = 256
+CONST MAX_STACK_SIZE     = 1048576
+
+CONST THREAD_QUANTUM     = 1000         # Instructions before preemption
+CONST MESSAGE_QUEUE_INIT = 32           # Initial mailbox size
+
+# Thread states
+CONST STATE_NEW          = 0x00
+CONST STATE_READY        = 0x01
+CONST STATE_RUNNING      = 0x02
+CONST STATE_BLOCKED      = 0x03         # Waiting for message
+CONST STATE_SLEEPING     = 0x04         # Timed sleep
+CONST STATE_DEAD         = 0x05
+CONST STATE_ERROR        = 0x06
+
+# Thread flags
+CONST FLAG_TRAP_EXIT     = 0x01         # Trap exit signals
+CONST FLAG_SYSTEM        = 0x02         # System thread
+CONST FLAG_MONITOR       = 0x04         # Being monitored
+CONST FLAG_LINKED        = 0x08         # Has links
+
+# Message priorities
+CONST PRIORITY_SYSTEM    = 0
+CONST PRIORITY_HIGH      = 1  
+CONST PRIORITY_NORMAL    = 2
+CONST PRIORITY_LOW       = 3
+
+########################################
+# SECTION 1 — THREAD STRUCTURE
+########################################
+
+TYPE ThreadID = u32
+
+STRUCT Thread:
+    # Identity
+    id          : ThreadID
+    name        : Value                  # Optional symbol name
+    
+    # State
+    state       : u8
+    flags       : u8
+    priority    : u8
+    error_value : Value                  # Last error if STATE_ERROR
+    
+    # Stack
+    stack       : ARRAY[*] OF Value     # Value stack
+    stack_size  : u32                   # Allocated size
+    stack_top   : u32                   # Current top
+    
+    # Execution context
+    pc          : u32                   # Program counter
+    fp          : u32                   # Frame pointer
+    closure     : Value                 # Current closure
+    
+    # Scheduling
+    quantum     : i32                   # Instructions left
+    sleep_until : u64                   # Timestamp for sleeping threads
+    
+    # Message passing
+    mailbox     : MessageQueue
+    
+    # Links and monitors
+    links       : ARRAY<ThreadID>       # Bidirectional failure propagation
+    monitors    : ARRAY<Monitor>        # Unidirectional monitoring
+    
+    # Scheduler links
+    next        : Thread*               # Next in ready/blocked queue
+    prev        : Thread*               # Previous in queue
+END
+
+STRUCT Message:
+    sender   : ThreadID                 # 0 for system messages
+    tag      : Value                    # Message tag/pattern
+    data     : Value                    # Message payload
+    priority : u8
+    next     : Message*                 # Linked list
+END
+
+STRUCT MessageQueue:
+    head     : ARRAY[4] OF Message*     # Per-priority queues
+    tail     : ARRAY[4] OF Message*
+    count    : u32
+    capacity : u32                      # For flow control
+END
+
+STRUCT Monitor:
+    monitored : ThreadID                # Thread being monitored
+    ref       : u64                     # Unique monitor reference
+END
+
+########################################
+# SECTION 2 — SCHEDULER STATE
+########################################
+
+STRUCT Scheduler:
+    # Thread table
+    threads      : ARRAY[MAX_THREADS] OF Thread*
+    thread_count : u32
+    next_id      : ThreadID
+    
+    # Run queues (per priority)
+    ready_queues : ARRAY[4] OF ThreadQueue
+    blocked_list : Thread*              # Threads waiting for messages
+    sleep_queue  : Thread*              # Sleeping threads (sorted by wake time)
+    
+    # Current execution
+    current      : Thread*
+    tick_count   : u64                  # Global tick counter
+    
+    # Statistics
+    total_spawned    : u64
+    total_messages   : u64
+    total_reductions : u64
+END
+
+STRUCT ThreadQueue:
+    head : Thread*
+    tail : Thread*
+    size : u32
+END
+
+GLOBAL Scheduler g_scheduler
+
+########################################
+# SECTION 3 — THREAD LIFECYCLE
+########################################
+
+FUNCTION SPAWN(closure: Value, args: ARRAY<Value>, opts: SpawnOpts) RETURNS ThreadID:
+    # Allocate new thread
+    thread := ALLOC_THREAD()
+    IF thread == nil:
+        ERROR("Thread limit reached")
+    END
+    
+    # Initialize thread
+    thread->id := g_scheduler.next_id++
+    thread->name := opts.name OR VAL_NIL
+    thread->state := STATE_NEW
+    thread->flags := 0
+    thread->priority := opts.priority OR PRIORITY_NORMAL
+    
+    # Allocate stack
+    stack_size := opts.stack_size OR DEFAULT_STACK_SIZE
+    thread->stack := ALLOC_ARRAY(Value, stack_size)
+    thread->stack_size := stack_size
+    thread->stack_top := 0
+    
+    # Set up initial call frame
+    thread->closure := closure
+    thread->pc := 0
+    thread->fp := 0
+    
+    # Push arguments
+    FOR arg IN args:
+        PUSH_STACK(thread, arg)
+    END
+    
+    # Initialize mailbox
+    INIT_MESSAGE_QUEUE(&thread->mailbox)
+    
+    # Add to scheduler
+    g_scheduler.threads[thread->id] := thread
+    g_scheduler.thread_count++
+    g_scheduler.total_spawned++
+    
+    # Make ready
+    thread->state := STATE_READY
+    ENQUEUE_READY(thread)
+    
+    # Link to parent if requested
+    IF opts.link AND g_scheduler.current != nil:
+        LINK_THREADS(g_scheduler.current->id, thread->id)
+    END
+    
+    RETURN thread->id
+END
+
+FUNCTION SPAWN_LINK(closure: Value, args: ARRAY<Value>) RETURNS ThreadID:
+    opts := SpawnOpts{link: true}
+    RETURN SPAWN(closure, args, opts)
+END
+
+PROCEDURE EXIT_THREAD(thread: Thread*, reason: Value):
+    thread->state := STATE_DEAD
+    thread->error_value := reason
+    
+    # Send exit signals to linked threads
+    IF thread->flags AND FLAG_LINKED:
+        FOR linked_id IN thread->links:
+            SEND_EXIT_SIGNAL(thread->id, linked_id, reason)
+        END
+    END
+    
+    # Notify monitors
+    IF thread->flags AND FLAG_MONITOR:
+        FOR monitor IN thread->monitors:
+            msg := MAKE_TUPLE(
+                MAKE_SYMBOL(INTERN("DOWN")),
+                MAKE_INT48(monitor.ref),
+                MAKE_INT48(thread->id),
+                reason
+            )
+            SEND_MESSAGE(monitor.monitored, thread->id, msg, PRIORITY_HIGH)
+        END
+    END
+    
+    # Clean up resources
+    FREE_THREAD(thread)
+END
+
+########################################
+# SECTION 4 — MESSAGE PASSING
+########################################
+
+PROCEDURE SEND_MESSAGE(target: ThreadID, sender: ThreadID, msg: Value, priority: u8):
+    thread := g_scheduler.threads[target]
+    IF thread == nil OR thread->state == STATE_DEAD:
+        RETURN  # Silently drop messages to dead threads
+    END
+    
+    # Create message
+    message := ALLOC(Message)
+    message->sender := sender
+    message->tag := msg  # Can be refined for pattern matching
+    message->data := msg
+    message->priority := priority
+    message->next := nil
+    
+    # Enqueue in mailbox
+    queue := &thread->mailbox
+    IF queue->tail[priority] == nil:
+        queue->head[priority] := message
+        queue->tail[priority] := message
+    ELSE:
+        queue->tail[priority]->next := message
+        queue->tail[priority] := message
+    END
+    
+    queue->count++
+    g_scheduler.total_messages++
+    
+    # Wake thread if blocked
+    IF thread->state == STATE_BLOCKED:
+        thread->state := STATE_READY
+        REMOVE_FROM_BLOCKED(thread)
+        ENQUEUE_READY(thread)
+    END
+END
+
+FUNCTION RECEIVE_MESSAGE(thread: Thread*, patterns: ARRAY<Pattern>, timeout: i64) RETURNS Value:
+    start_time := CURRENT_TIME_MS()
+    
+    LOOP:
+        # Try to match messages in priority order
+        FOR priority := 0 TO 3:
+            msg := TRY_MATCH_MESSAGE(thread, priority, patterns)
+            IF msg != VAL_NIL:
+                RETURN msg
+            END
+        END
+        
+        # No matching message
+        IF timeout == 0:
+            # Non-blocking receive
+            RETURN VAL_NIL
+        END
+        
+        IF timeout > 0:
+            elapsed := CURRENT_TIME_MS() - start_time
+            IF elapsed >= timeout:
+                RETURN MAKE_TUPLE(
+                    MAKE_SYMBOL(INTERN("timeout")),
+                    VAL_NIL
+                )
+            END
+        END
+        
+        # Block thread
+        thread->state := STATE_BLOCKED
+        YIELD_THREAD(thread)
+    END
+END
+
+FUNCTION TRY_MATCH_MESSAGE(thread: Thread*, priority: u8, patterns: ARRAY<Pattern>) RETURNS Value:
+    queue := &thread->mailbox
+    prev := nil AS Message*
+    curr := queue->head[priority]
+    
+    WHILE curr != nil:
+        # Try each pattern
+        FOR pattern IN patterns:
+            IF MATCH_PATTERN(curr->data, pattern):
+                # Remove message from queue
+                IF prev == nil:
+                    queue->head[priority] := curr->next
+                ELSE:
+                    prev->next := curr->next
+                END
+                
+                IF curr == queue->tail[priority]:
+                    queue->tail[priority] := prev
+                END
+                
+                queue->count--
+                
+                # Return matched message
+                result := curr->data
+                FREE(curr)
+                RETURN result
+            END
+        END
+        
+        prev := curr
+        curr := curr->next
+    END
+    
+    RETURN VAL_NIL
+END
+
+########################################
+# SECTION 5 — LINKING & MONITORING
+########################################
+
+PROCEDURE LINK_THREADS(id1: ThreadID, id2: ThreadID):
+    thread1 := g_scheduler.threads[id1]
+    thread2 := g_scheduler.threads[id2]
+    
+    IF thread1 == nil OR thread2 == nil:
+        RETURN
+    END
+    
+    # Add bidirectional link
+    APPEND(thread1->links, id2)
+    APPEND(thread2->links, id1)
+    
+    thread1->flags := thread1->flags OR FLAG_LINKED
+    thread2->flags := thread2->flags OR FLAG_LINKED
+    
+    # If either thread is already dead, propagate
+    IF thread1->state == STATE_DEAD:
+        SEND_EXIT_SIGNAL(id1, id2, thread1->error_value)
+    END
+    IF thread2->state == STATE_DEAD:
+        SEND_EXIT_SIGNAL(id2, id1, thread2->error_value)
+    END
+END
+
+FUNCTION MONITOR_THREAD(watcher: ThreadID, watched: ThreadID) RETURNS u64:
+    thread := g_scheduler.threads[watcher]
+    target := g_scheduler.threads[watched]
+    
+    IF thread == nil OR target == nil:
+        RETURN 0
+    END
+    
+    # Create monitor
+    ref := GENERATE_REF()
+    monitor := Monitor{monitored: watched, ref: ref}
+    APPEND(thread->monitors, monitor)
+    
+    target->flags := target->flags OR FLAG_MONITOR
+    
+    # If target already dead, send immediate notification
+    IF target->state == STATE_DEAD:
+        msg := MAKE_TUPLE(
+            MAKE_SYMBOL(INTERN("DOWN")),
+            MAKE_INT48(ref),
+            MAKE_INT48(watched),
+            target->error_value
+        )
+        SEND_MESSAGE(watcher, 0, msg, PRIORITY_HIGH)
+    END
+    
+    RETURN ref
+END
+
+PROCEDURE SEND_EXIT_SIGNAL(from: ThreadID, to: ThreadID, reason: Value):
+    thread := g_scheduler.threads[to]
+    IF thread == nil OR thread->state == STATE_DEAD:
+        RETURN
+    END
+    
+    IF thread->flags AND FLAG_TRAP_EXIT:
+        # Convert to regular message
+        msg := MAKE_TUPLE(
+            MAKE_SYMBOL(INTERN("EXIT")),
+            MAKE_INT48(from),
+            reason
+        )
+        SEND_MESSAGE(to, from, msg, PRIORITY_HIGH)
+    ELSE:
+        # Propagate exit
+        IF reason != MAKE_SYMBOL(INTERN("normal")):
+            EXIT_THREAD(thread, reason)
+        END
+    END
+END
+
+########################################
+# SECTION 6 — SCHEDULER OPERATIONS
+########################################
+
+PROCEDURE SCHEDULER_INIT():
+    g_scheduler.thread_count := 0
+    g_scheduler.next_id := 1
+    g_scheduler.current := nil
+    g_scheduler.tick_count := 0
+    
+    FOR i := 0 TO 3:
+        g_scheduler.ready_queues[i].head := nil
+        g_scheduler.ready_queues[i].tail := nil
+        g_scheduler.ready_queues[i].size := 0
+    END
+    
+    g_scheduler.blocked_list := nil
+    g_scheduler.sleep_queue := nil
+END
+
+PROCEDURE SCHEDULER_RUN():
+    WHILE g_scheduler.thread_count > 0:
+        # Check sleeping threads
+        WAKE_SLEEPING_THREADS()
+        
+        # Find next ready thread
+        thread := DEQUEUE_READY()
+        IF thread == nil:
+            # No ready threads - check if all blocked
+            IF g_scheduler.blocked_list == nil AND g_scheduler.sleep_queue == nil:
+                BREAK  # Deadlock or completion
+            END
+            IDLE_WAIT()
+            CONTINUE
+        END
+        
+        # Run thread
+        g_scheduler.current := thread
+        thread->state := STATE_RUNNING
+        thread->quantum := THREAD_QUANTUM
+        
+        # Execute until quantum expires or thread blocks
+        WHILE thread->quantum > 0 AND thread->state == STATE_RUNNING:
+            RUN_INSTRUCTION(thread)
+            thread->quantum--
+            g_scheduler.total_reductions++
+        END
+        
+        # Handle post-execution state
+        CASE thread->state OF:
+            STATE_RUNNING:
+                # Quantum expired - preempt
+                thread->state := STATE_READY
+                ENQUEUE_READY(thread)
+                
+            STATE_BLOCKED:
+                # Waiting for message
+                ADD_TO_BLOCKED(thread)
+                
+            STATE_SLEEPING:
+                # Timed sleep
+                ADD_TO_SLEEP_QUEUE(thread)
+                
+            STATE_DEAD:
+                # Thread terminated
+                # Already cleaned up in EXIT_THREAD
+                
+            DEFAULT:
+                # Error state - handle appropriately
+                ERROR("Invalid thread state: " + thread->state)
+        END
+        
+        g_scheduler.current := nil
+        g_scheduler.tick_count++
+    END
+END
+
+PROCEDURE ENQUEUE_READY(thread: Thread*):
+    priority := thread->priority
+    queue := &g_scheduler.ready_queues[priority]
+    
+    thread->next := nil
+    thread->prev := queue->tail
+    
+    IF queue->tail != nil:
+        queue->tail->next := thread
+    ELSE:
+        queue->head := thread
+    END
+    
+    queue->tail := thread
+    queue->size++
+END
+
+FUNCTION DEQUEUE_READY() RETURNS Thread*:
+    # Check queues in priority order
+    FOR priority := 0 TO 3:
+        queue := &g_scheduler.ready_queues[priority]
+        IF queue->head != nil:
+            thread := queue->head
+            queue->head := thread->next
+            
+            IF queue->head == nil:
+                queue->tail := nil
+            ELSE:
+                queue->head->prev := nil
+            END
+            
+            queue->size--
+            thread->next := nil
+            thread->prev := nil
+            
+            RETURN thread
+        END
+    END
+    
+    RETURN nil
+END
+
+########################################
+# SECTION 7 — BUILTIN OPERATIONS
+########################################
+
+# Thread control primitives exposed to Diyrbal
+
+FUNCTION PRIM_SELF() RETURNS Value:
+    IF g_scheduler.current == nil:
+        RETURN VAL_NIL
+    END
+    RETURN MAKE_INT48(g_scheduler.current->id)
+END
+
+FUNCTION PRIM_SPAWN(closure: Value) RETURNS Value:
+    IF NOT IS_CLOSURE(closure):
+        ERROR("spawn requires a closure")
+    END
+    
+    tid := SPAWN(closure, EMPTY_ARRAY, DEFAULT_SPAWN_OPTS)
+    RETURN MAKE_INT48(tid)
+END
+
+FUNCTION PRIM_SEND(tid: Value, msg: Value) RETURNS Value:
+    IF NOT IS_INT48(tid):
+        ERROR("send requires thread ID")
+    END
+    
+    target := GET_INT48(tid) AS ThreadID
+    sender := 0 AS ThreadID
+    IF g_scheduler.current != nil:
+        sender := g_scheduler.current->id
+    END
+    
+    SEND_MESSAGE(target, sender, msg, PRIORITY_NORMAL)
+    RETURN msg
+END
+
+FUNCTION PRIM_RECEIVE(timeout: Value) RETURNS Value:
+    IF g_scheduler.current == nil:
+        ERROR("receive called outside thread context")
+    END
+    
+    timeout_ms := -1 AS i64  # Default: block forever
+    IF IS_INT48(timeout):
+        timeout_ms := GET_INT48(timeout)
+    END
+    
+    # For now, match any message
+    patterns := ARRAY[1] OF Pattern
+    patterns[0] := WILDCARD_PATTERN
+    
+    RETURN RECEIVE_MESSAGE(g_scheduler.current, patterns, timeout_ms)
+END
+
+FUNCTION PRIM_LINK(tid: Value) RETURNS Value:
+    IF NOT IS_INT48(tid) OR g_scheduler.current == nil:
+        ERROR("link requires thread ID")
+    END
+    
+    LINK_THREADS(g_scheduler.current->id, GET_INT48(tid) AS ThreadID)
+    RETURN VAL_TRUE
+END
+
+FUNCTION PRIM_MONITOR(tid: Value) RETURNS Value:
+    IF NOT IS_INT48(tid) OR g_scheduler.current == nil:
+        ERROR("monitor requires thread ID")
+    END
+    
+    ref := MONITOR_THREAD(g_scheduler.current->id, GET_INT48(tid) AS ThreadID)
+    RETURN MAKE_INT48(ref)
+END
+
+########################################
+# SECTION 8 — SELECTIVE RECEIVE
+########################################
+
+# Pattern matching for selective receive (simplified)
+
+TYPE Pattern = VARIANT OF:
+    | Wildcard
+    | Literal OF Value
+    | Tuple OF ARRAY<Pattern>
+    | Guard OF (Value) -> bool
+END
+
+FUNCTION MATCH_PATTERN(value: Value, pattern: Pattern) RETURNS bool:
+    CASE pattern OF:
+        Wildcard:
+            RETURN true
+            
+        Literal(expected):
+            RETURN VALUES_EQUAL(value, expected)
+            
+        Tuple(patterns):
+            IF NOT IS_TUPLE(value):
+                RETURN false
+            END
+            elements := TUPLE_ELEMENTS(value)
+            IF LEN(elements) != LEN(patterns):
+                RETURN false
+            END
+            FOR i := 0 TO LEN(patterns) - 1:
+                IF NOT MATCH_PATTERN(elements[i], patterns[i]):
+                    RETURN false
+                END
+            END
+            RETURN true
+            
+        Guard(predicate):
+            RETURN predicate(value)
+    END
+END
+
+########################################
+# SECTION 9 — ERROR HANDLING
+########################################
+
+PROCEDURE HANDLE_THREAD_ERROR(thread: Thread*, error: Value):
+    thread->state := STATE_ERROR
+    thread->error_value := error
+    
+    # Log error for debugging
+    LOG_ERROR("Thread " + thread->id + " error: " + VALUE_TO_STRING(error))
+    
+    # Exit thread with error reason
+    EXIT_THREAD(thread, error)
+END
+
+FUNCTION PRIM_TRAP_EXIT(enable: Value) RETURNS Value:
+    IF g_scheduler.current == nil:
+        ERROR("trap_exit called outside thread context")
+    END
+    
+    IF IS_TRUE(enable):
+        g_scheduler.current->flags := g_scheduler.current->flags OR FLAG_TRAP_EXIT
+    ELSE:
+        g_scheduler.current->flags := g_scheduler.current->flags AND NOT FLAG_TRAP_EXIT
+    END
+    
+    RETURN enable
+END
+
+########################################
+# SECTION 10 — EXAMPLE USAGE
+########################################
+
+PROCEDURE EXAMPLE_PING_PONG():
+    # Create ping process
+    ping_fn := CREATE_CLOSURE(
+        LAMBDA():
+            LOOP:
+                msg := PRIM_RECEIVE(-1)
+                CASE msg OF:
+                    TUPLE("ping", sender):
+                        PRINT("Ping received from " + sender)
+                        PRIM_SEND(sender, MAKE_TUPLE("pong", PRIM_SELF()))
+                        
+                    TUPLE("stop", _):
+                        PRINT("Ping stopping")
+                        BREAK
+                END
+            END
+        END
+    )
+    
+    # Create pong process  
+    pong_fn := CREATE_CLOSURE(
+        LAMBDA():
+            ping_tid := PRIM_RECEIVE(5000)  # Wait for ping ID
+            
+            # Start the game
+            PRIM_SEND(ping_tid, MAKE_TUPLE("ping", PRIM_SELF()))
+            
+            count := 0
+            LOOP:
+                msg := PRIM_RECEIVE(1000)
+                CASE msg OF:
+                    TUPLE("pong", sender):
+                        count++
+                        PRINT("Pong received, count = " + count)
+                        IF count < 10:
+                            SLEEP(100)
+                            PRIM_SEND(sender, MAKE_TUPLE("ping", PRIM_SELF()))
+                        ELSE:
+                            PRIM_SEND(sender, MAKE_TUPLE("stop"))
+                            BREAK
+                        END
+                        
+                    TUPLE("timeout"):
+                        PRINT("Pong timeout!")
+                        BREAK
+                END
+            END
+        END
+    )
+    
+    # Spawn processes
+    ping_tid := PRIM_SPAWN(ping_fn)
+    pong_tid := PRIM_SPAWN(pong_fn)
+    
+    # Tell pong about ping
+    PRIM_SEND(pong_tid, ping_tid)
+    
+    # Let them play
+    SCHEDULER_RUN()
+END
+
+########################################
+# APPENDIX — IMPLEMENTATION NOTES
+########################################
+
+# • Green threads are cooperatively scheduled with preemption after quantum
+# • Each thread has its own stack but shares the heap
+# • Message passing is asynchronous and buffered
+# • No shared mutable state between threads (actor model)
+# • Failure propagation through links (bidirectional) and monitors (unidirectional)
+# • Selective receive with pattern matching on messages
+# • Mailboxes preserve message order within each priority level
+# • Scheduler uses multiple ready queues for priority scheduling
+# • Sleep queue is maintained in sorted order for efficient wakeup
+# • Thread IDs are recycled after sufficient time to avoid ABA problems
+

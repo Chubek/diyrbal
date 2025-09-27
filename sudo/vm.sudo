@@ -1,0 +1,794 @@
+LANGUAGE = "sudolang"
+
+############################################################
+#  DIYRBAL VIRTUAL MACHINE                                 #
+#  Register-based VM with SSA influence and concurrency    #
+############################################################
+
+########################################
+# SECTION 0 — OPCODES & CONSTANTS
+########################################
+
+# === Instruction Format ===
+# 32-bit instructions: [opcode:8][dest:8][src1:8][src2:8]
+# Some instructions use 16-bit immediate: [opcode:8][dest:8][imm:16]
+
+# Basic operations
+CONST OP_NOP          = 0x00
+CONST OP_MOVE         = 0x01    # r[d] = r[s1]
+CONST OP_LOADK        = 0x02    # r[d] = k[imm]
+CONST OP_LOADNIL      = 0x03    # r[d] = nil
+CONST OP_LOADTRUE     = 0x04    # r[d] = true
+CONST OP_LOADFALSE    = 0x05    # r[d] = false
+
+# Arithmetic (SSA-style - always create new value)
+CONST OP_ADD          = 0x10    # r[d] = r[s1] + r[s2]
+CONST OP_SUB          = 0x11    # r[d] = r[s1] - r[s2]
+CONST OP_MUL          = 0x12    # r[d] = r[s1] * r[s2]
+CONST OP_DIV          = 0x13    # r[d] = r[s1] / r[s2]
+CONST OP_MOD          = 0x14    # r[d] = r[s1] % r[s2]
+CONST OP_POW          = 0x15    # r[d] = r[s1] ^ r[s2]
+CONST OP_NEG          = 0x16    # r[d] = -r[s1]
+
+# Comparison
+CONST OP_EQ           = 0x20    # r[d] = r[s1] == r[s2]
+CONST OP_NE           = 0x21    # r[d] = r[s1] != r[s2]
+CONST OP_LT           = 0x22    # r[d] = r[s1] < r[s2]
+CONST OP_LE           = 0x23    # r[d] = r[s1] <= r[s2]
+CONST OP_GT           = 0x24    # r[d] = r[s1] > r[s2]
+CONST OP_GE           = 0x25    # r[d] = r[s1] >= r[s2]
+
+# Logical
+CONST OP_AND          = 0x28    # r[d] = r[s1] AND r[s2]
+CONST OP_OR           = 0x29    # r[d] = r[s1] OR r[s2]
+CONST OP_NOT          = 0x2A    # r[d] = NOT r[s1]
+
+# Control flow
+CONST OP_JMP          = 0x30    # pc += imm
+CONST OP_JMPIF        = 0x31    # if r[s1] then pc += imm
+CONST OP_JMPNIF       = 0x32    # if NOT r[s1] then pc += imm
+CONST OP_PHI          = 0x33    # SSA phi function
+
+# Function calls
+CONST OP_CALL         = 0x40    # call r[s1](r[s1+1]...r[s1+s2])
+CONST OP_TAILCALL     = 0x41    # tail call optimization
+CONST OP_RETURN       = 0x42    # return r[s1]...r[s1+s2]
+CONST OP_CLOSURE      = 0x43    # r[d] = closure(proto[imm])
+
+# Object operations
+CONST OP_NEWOBJ       = 0x50    # r[d] = new instance(r[s1])
+CONST OP_GETATTR      = 0x51    # r[d] = r[s1].r[s2]
+CONST OP_SETATTR      = 0x52    # r[s1].r[s2] = r[d]
+CONST OP_GETMETHOD    = 0x53    # r[d] = method(r[s1], r[s2])
+CONST OP_SUPER        = 0x54    # r[d] = super(r[s1], r[s2])
+
+# Class/metaclass operations
+CONST OP_NEWCLASS     = 0x58    # r[d] = new class
+CONST OP_SETMETA      = 0x59    # set metaclass
+CONST OP_GETMETA      = 0x5A    # r[d] = metaclass(r[s1])
+CONST OP_ISINSTANCE   = 0x5B    # r[d] = r[s1] instanceof r[s2]
+
+# Array operations
+CONST OP_NEWARRAY     = 0x60    # r[d] = array(size=r[s1])
+CONST OP_GETARRAY     = 0x61    # r[d] = r[s1][r[s2]]
+CONST OP_SETARRAY     = 0x62    # r[s1][r[s2]] = r[d]
+CONST OP_ARRAYLEN     = 0x63    # r[d] = len(r[s1])
+
+# Table/dict operations
+CONST OP_NEWTABLE     = 0x68    # r[d] = {}
+CONST OP_GETTABLE     = 0x69    # r[d] = r[s1][r[s2]]
+CONST OP_SETTABLE     = 0x6A    # r[s1][r[s2]] = r[d]
+
+# Upvalue operations (for closures)
+CONST OP_GETUPVAL     = 0x70    # r[d] = upval[s1]
+CONST OP_SETUPVAL     = 0x71    # upval[s1] = r[d]
+CONST OP_CLOSEUPVAL   = 0x72    # close upvalues >= r[s1]
+
+# Concurrency operations
+CONST OP_SPAWN        = 0x80    # r[d] = spawn(r[s1])
+CONST OP_SEND         = 0x81    # send(r[s1], r[s2])
+CONST OP_RECEIVE      = 0x82    # r[d] = receive(timeout=r[s1])
+CONST OP_YIELD        = 0x83    # yield control
+CONST OP_SELF         = 0x84    # r[d] = current thread ID
+
+# Exception handling
+CONST OP_TRY          = 0x90    # try block start
+CONST OP_CATCH        = 0x91    # catch handler
+CONST OP_THROW        = 0x92    # throw r[s1]
+CONST OP_FINALLY      = 0x93    # finally block
+
+########################################
+# SECTION 1 — VM STATE STRUCTURES
+########################################
+
+STRUCT VMState:
+    # Global state
+    threads      : Scheduler         # Thread scheduler
+    globals      : HashTable         # Global variables
+    strings      : StringTable       # String interning
+    
+    # Memory management
+    heap         : Heap*             # From alloc.sudo
+    gc_threshold : u64               # GC trigger
+    
+    # Loaded code
+    modules      : HashTable         # Module name -> Module
+    main_module  : Module*           # Entry point
+END
+
+STRUCT Module:
+    name       : Value               # Module name
+    constants  : ARRAY<Value>        # Constant pool
+    protos     : ARRAY<Proto*>       # Function prototypes
+    globals    : HashTable           # Module globals
+END
+
+STRUCT Frame:
+    # Function context
+    closure    : Closure*            # Current closure
+    pc         : u32                 # Program counter
+    base       : u32                 # Base register in stack
+    
+    # SSA phi tracking
+    phi_nodes  : ARRAY<PhiNode>     # Active phi nodes
+    
+    # Exception handling
+    handlers   : ARRAY<Handler>      # Active exception handlers
+    
+    # Caller info
+    prev       : Frame*              # Previous frame
+    ret_base   : u32                 # Where to place return values
+END
+
+STRUCT PhiNode:
+    dest_reg   : u8                  # Destination register
+    sources    : ARRAY<PhiSource>    # Source registers per predecessor
+END
+
+STRUCT PhiSource:
+    block_id   : u32                 # Predecessor block
+    reg        : u8                  # Source register
+    value      : Value               # Cached value (optional)
+END
+
+########################################
+# SECTION 2 — REGISTER ALLOCATION
+########################################
+
+# Register-based VM with unlimited virtual registers
+# SSA form ensures each register is assigned exactly once
+
+STRUCT RegisterFile:
+    values     : ARRAY<Value>        # Register values
+    size       : u32                 # Current allocation
+    capacity   : u32                 # Max allocated
+    
+    # SSA tracking
+    def_count  : ARRAY<u8>           # Times each register defined
+    use_count  : ARRAY<u16>          # Times each register used
+END
+
+FUNCTION ALLOC_REGISTERS(count: u32) RETURNS RegisterFile:
+    regs.values := ALLOC_ARRAY(Value, count)
+    regs.size := count
+    regs.capacity := count
+    regs.def_count := ALLOC_ARRAY(u8, count)
+    regs.use_count := ALLOC_ARRAY(u16, count)
+    
+    # Initialize all registers to nil
+    FOR i := 0 TO count - 1:
+        regs.values[i] := VAL_NIL
+        regs.def_count[i] := 0
+        regs.use_count[i] := 0
+    END
+    
+    RETURN regs
+END
+
+########################################
+# SECTION 3 — INSTRUCTION EXECUTION
+########################################
+
+FUNCTION EXECUTE_THREAD(thread: Thread*):
+    frame := thread->current_frame
+    
+    WHILE frame != nil:
+        instr := FETCH_INSTRUCTION(frame)
+        opcode := GET_OPCODE(instr)
+        
+        # Check for preemption
+        thread->quantum--
+        IF thread->quantum <= 0:
+            YIELD_THREAD(thread)
+            RETURN
+        END
+        
+        # Dispatch instruction
+        CASE opcode OF:
+            OP_MOVE:
+                EXECUTE_MOVE(frame, instr)
+                
+            OP_LOADK:
+                EXECUTE_LOADK(frame, instr)
+                
+            OP_ADD:
+                EXECUTE_BINARY_OP(frame, instr, ADD_VALUES)
+                
+            OP_CALL:
+                EXECUTE_CALL(frame, instr)
+                
+            OP_RETURN:
+                frame := EXECUTE_RETURN(frame, instr)
+                
+            OP_JMP:
+                EXECUTE_JMP(frame, instr)
+                
+            OP_JMPIF:
+                EXECUTE_CONDITIONAL_JMP(frame, instr, true)
+                
+            OP_PHI:
+                EXECUTE_PHI(frame, instr)
+                
+            # Object operations
+            OP_NEWOBJ:
+                EXECUTE_NEWOBJ(frame, instr)
+                
+            OP_GETATTR:
+                EXECUTE_GETATTR(frame, instr)
+                
+            OP_SETATTR:
+                EXECUTE_SETATTR(frame, instr)
+                
+            # Closures
+            OP_CLOSURE:
+                EXECUTE_CLOSURE(frame, instr)
+                
+            OP_GETUPVAL:
+                EXECUTE_GETUPVAL(frame, instr)
+                
+            OP_SETUPVAL:
+                EXECUTE_SETUPVAL(frame, instr)
+                
+            # Concurrency
+            OP_SPAWN:
+                EXECUTE_SPAWN(frame, instr)
+                
+            OP_SEND:
+                EXECUTE_SEND(frame, instr)
+                
+            OP_RECEIVE:
+                EXECUTE_RECEIVE(frame, instr)
+                
+            DEFAULT:
+                ERROR("Unknown opcode: " + opcode)
+        END
+        
+        frame->pc++
+    END
+END
+
+########################################
+# SECTION 4 — SSA PHI IMPLEMENTATION
+########################################
+
+PROCEDURE EXECUTE_PHI(frame: Frame*, instr: u32):
+    dest := GET_DEST(instr)
+    phi_index := GET_IMM16(instr)
+    
+    # Get phi node from current block
+    phi := &frame->phi_nodes[phi_index]
+    
+    # Determine which predecessor we came from
+    prev_block := frame->prev_block
+    
+    # Find matching source
+    FOR source IN phi->sources:
+        IF source.block_id == prev_block:
+            # SSA guarantee: register should be defined
+            value := REG(frame, source.reg)
+            SET_REG(frame, dest, value)
+            RETURN
+        END
+    END
+    
+    ERROR("PHI node has no source for predecessor block")
+END
+
+# Special handling for phi nodes at block boundaries
+PROCEDURE PREPARE_PHI_NODES(frame: Frame*, target_block: u32):
+    block_info := GET_BLOCK_INFO(frame->closure->proto, target_block)
+    
+    FOR phi IN block_info->phi_nodes:
+        # Pre-calculate values from current block
+        FOR i, source IN ENUMERATE(phi->sources):
+            IF source.block_id == frame->current_block:
+                source.value := REG(frame, source.reg)
+            END
+        END
+    END
+    
+    frame->prev_block := frame->current_block
+    frame->current_block := target_block
+END
+
+########################################
+# SECTION 5 — OBJECT OPERATIONS
+########################################
+
+PROCEDURE EXECUTE_NEWOBJ(frame: Frame*, instr: u32):
+    dest := GET_DEST(instr)
+    class_reg := GET_SRC1(instr)
+    
+    class_val := REG(frame, class_reg)
+    IF NOT IS_CLASS(class_val):
+        THROW_ERROR("Expected class in NEWOBJ")
+    END
+    
+    class := GET_PTR(class_val) AS Class*
+    
+    # Allocate instance
+    size := SIZEOF(Instance) + class->instance_size
+    instance := ALLOC(size) AS Instance*
+    
+    # Initialize object header
+    instance->header.type_flags := HTYPE_INSTANCE
+    instance->header.metaclass := class_val
+    
+    # Initialize slots to nil
+    FOR i := 0 TO class->ivar_count - 1:
+        instance->slots[i] := VAL_NIL
+    END
+    
+    # Store in destination register
+    SET_REG(frame, dest, MAKE_PTR(instance))
+    
+    # Call __init__ if present
+    init_method := LOOKUP_METHOD(class, INTERN("__init__"))
+    IF init_method != VAL_NIL:
+        # Set up call to __init__
+        SETUP_METHOD_CALL(frame, instance, init_method)
+    END
+END
+
+PROCEDURE EXECUTE_GETATTR(frame: Frame*, instr: u32):
+    dest := GET_DEST(instr)
+    obj_reg := GET_SRC1(instr)
+    name_reg := GET_SRC2(instr)
+    
+    obj := REG(frame, obj_reg)
+    name := REG(frame, name_reg)
+    
+    IF NOT IS_SYMBOL(name):
+        THROW_ERROR("Attribute name must be symbol")
+    END
+    
+    # Get object's class
+    class := GET_CLASS(obj)
+    
+    # Try instance variables first
+    IF IS_INSTANCE(obj):
+        instance := GET_PTR(obj) AS Instance*
+        slot_index := FIND_IVAR_INDEX(class, name)
+        IF slot_index >= 0:
+            SET_REG(frame, dest, instance->slots[slot_index])
+            RETURN
+        END
+    END
+    
+    # Try methods
+    method := LOOKUP_METHOD(class, name)
+    IF method != VAL_NIL:
+        # Create bound method
+        bound := CREATE_BOUND_METHOD(obj, method)
+        SET_REG(frame, dest, bound)
+        RETURN
+    END
+    
+    # Try __getattr__
+    getattr := LOOKUP_METHOD(class, INTERN("__getattr__"))
+    IF getattr != VAL_NIL:
+        SETUP_METHOD_CALL(frame, obj, getattr, name)
+        RETURN
+    END
+    
+    THROW_ERROR("Attribute not found: " + SYMBOL_NAME(name))
+END
+
+########################################
+# SECTION 6 — CLOSURE OPERATIONS
+########################################
+
+PROCEDURE EXECUTE_CLOSURE(frame: Frame*, instr: u32):
+    dest := GET_DEST(instr)
+    proto_index := GET_IMM16(instr)
+    
+    proto := frame->closure->proto->nested_protos[proto_index]
+    
+    # Create new closure
+    closure := ALLOC(Closure)
+    closure->header.type_flags := HTYPE_CLOSURE
+    closure->header.metaclass := MAKE_PTR(g_closure_class)
+    closure->proto := proto
+    closure->upval_count := proto->upval_count
+    
+    # Capture upvalues
+    closure->upvalues := ALLOC_ARRAY(Upvalue*, proto->upval_count)
+    
+    FOR i := 0 TO proto->upval_count - 1:
+        upval_info := &proto->upval_info[i]
+        
+        IF upval_info->in_stack:
+            # Capture from current frame's registers
+            reg := frame->base + upval_info->index
+            closure->upvalues[i] := CAPTURE_UPVALUE(thread, reg)
+        ELSE:
+            # Capture from parent closure's upvalues
+            closure->upvalues[i] := frame->closure->upvalues[upval_info->index]
+        END
+    END
+    
+    # Store closure
+    SET_REG(frame, dest, MAKE_PTR(closure))
+END
+
+FUNCTION CAPTURE_UPVALUE(thread: Thread*, reg_index: u32) RETURNS Upvalue*:
+    # Check if already captured
+    FOR upval IN thread->open_upvalues:
+        IF upval->location == &thread->stack[reg_index]:
+            RETURN upval
+        END
+    END
+    
+    # Create new upvalue
+    upval := ALLOC(Upvalue)
+    upval->header.type_flags := HTYPE_UPVALUE
+    upval->location := &thread->stack[reg_index]
+    upval->next := thread->open_upvalues
+    thread->open_upvalues := upval
+    
+    RETURN upval
+END
+
+PROCEDURE EXECUTE_GETUPVAL(frame: Frame*, instr: u32):
+    dest := GET_DEST(instr)
+    upval_index := GET_SRC1(instr)
+    
+    upval := frame->closure->upvalues[upval_index]
+    value := *upval->location
+    
+    SET_REG(frame, dest, value)
+END
+
+########################################
+# SECTION 7 — CONCURRENT OPERATIONS
+########################################
+
+PROCEDURE EXECUTE_SPAWN(frame: Frame*, instr: u32):
+    dest := GET_DEST(instr)
+    closure_reg := GET_SRC1(instr)
+    
+    closure_val := REG(frame, closure_reg)
+    IF NOT IS_CLOSURE(closure_val):
+        THROW_ERROR("spawn requires closure")
+    END
+    
+    # Create new thread with closure
+    tid := SPAWN(closure_val, EMPTY_ARRAY, DEFAULT_SPAWN_OPTS)
+    
+    SET_REG(frame, dest, MAKE_INT48(tid))
+END
+
+PROCEDURE EXECUTE_SEND(frame: Frame*, instr: u32):
+    tid_reg := GET_SRC1(instr)
+    msg_reg := GET_SRC2(instr)
+    
+    tid := REG(frame, tid_reg)
+    msg := REG(frame, msg_reg)
+    
+    IF NOT IS_INT48(tid):
+        THROW_ERROR("send requires thread ID")
+    END
+    
+    target := GET_INT48(tid) AS ThreadID
+    sender := thread->id
+    
+    SEND_MESSAGE(target, sender, msg, PRIORITY_NORMAL)
+END
+
+PROCEDURE EXECUTE_RECEIVE(frame: Frame*, instr: u32):
+    dest := GET_DEST(instr)
+    timeout_reg := GET_SRC1(instr)
+    
+    timeout := REG(frame, timeout_reg)
+    timeout_ms := -1 AS i64
+    
+    IF IS_INT48(timeout):
+        timeout_ms := GET_INT48(timeout)
+    END
+    
+    # Block thread and switch to scheduler
+    thread->state := STATE_BLOCKED
+    thread->receive_dest := dest
+    thread->receive_timeout := timeout_ms
+    
+    YIELD_THREAD(thread)
+END
+
+########################################
+# SECTION 8 — CONTROL FLOW
+########################################
+
+PROCEDURE EXECUTE_JMP(frame: Frame*, instr: u32):
+    offset := GET_IMM16_SIGNED(instr)
+    target := frame->pc + offset
+    
+    # Prepare phi nodes for target block
+    PREPARE_PHI_NODES(frame, GET_BLOCK_AT_PC(target))
+    
+    frame->pc := target - 1  # Will be incremented after
+END
+
+PROCEDURE EXECUTE_CONDITIONAL_JMP(frame: Frame*, instr: u32, jump_if_true: bool):
+    cond_reg := GET_SRC1(instr)
+    offset := GET_IMM16_SIGNED(instr)
+    
+    cond := REG(frame, cond_reg)
+    is_true := IS_TRUTHY(cond)
+    
+    IF (jump_if_true AND is_true) OR (NOT jump_if_true AND NOT is_true):
+        target := frame->pc + offset
+        PREPARE_PHI_NODES(frame, GET_BLOCK_AT_PC(target))
+        frame->pc := target - 1
+    END
+END
+
+########################################
+# SECTION 9 — FUNCTION CALLS
+########################################
+
+PROCEDURE EXECUTE_CALL(frame: Frame*, instr: u32):
+    func_reg := GET_SRC1(instr)
+    argc := GET_SRC2(instr)
+    
+    func := REG(frame, func_reg)
+    
+    # Determine function type
+    IF IS_CLOSURE(func):
+        closure := GET_PTR(func) AS Closure*
+        CALL_CLOSURE(frame, closure, func_reg + 1, argc)
+    ELIF IS_METHOD(func):
+        method := GET_PTR(func) AS Method*
+        CALL_METHOD(frame, method, func_reg + 1, argc)
+    ELIF IS_BUILTIN(func):
+        CALL_BUILTIN(frame, func, func_reg + 1, argc)
+    ELSE:
+        THROW_ERROR("Attempt to call non-function")
+    END
+END
+
+PROCEDURE CALL_CLOSURE(frame: Frame*, closure: Closure*, arg_base: u8, argc: u8):
+    proto := closure->proto
+    
+    # Check arity
+    IF NOT proto->varargs AND argc != proto->arity:
+        THROW_ERROR("Function expects " + proto->arity + " args, got " + argc)
+    END
+    
+    # Create new frame
+    new_frame := ALLOC(Frame)
+    new_frame->closure := closure
+    new_frame->pc := 0
+    new_frame->base := thread->stack_top
+    new_frame->prev := frame
+    
+    # Copy arguments to new frame's registers
+    FOR i := 0 TO argc - 1:
+        thread->stack[new_frame->base + i] := REG(frame, arg_base + i)
+    END
+    
+    # Initialize remaining registers
+    FOR i := argc TO proto->max_stack - 1:
+        thread->stack[new_frame->base + i] := VAL_NIL
+    END
+    
+    # Update stack
+    thread->stack_top := new_frame->base + proto->max_stack
+    thread->current_frame := new_frame
+END
+
+FUNCTION EXECUTE_RETURN(frame: Frame*, instr: u32) RETURNS Frame*:
+    ret_base := GET_SRC1(instr)
+    ret_count := GET_SRC2(instr)
+    
+    # Close any open upvalues
+    CLOSE_UPVALUES(thread, frame->base)
+    
+    # Get return values
+    returns := ARRAY[ret_count] OF Value
+    FOR i := 0 TO ret_count - 1:
+        returns[i] := REG(frame, ret_base + i)
+    END
+    
+    # Restore previous frame
+    prev_frame := frame->prev
+    IF prev_frame == nil:
+        # Thread finished
+        thread->state := STATE_DEAD
+        RETURN nil
+    END
+    
+    # Place return values in caller's registers
+    FOR i := 0 TO ret_count - 1:
+        thread->stack[frame->ret_base + i] := returns[i]
+    END
+    
+    # Restore stack
+    thread->stack_top := frame->base
+    thread->current_frame := prev_frame
+    
+    FREE(frame)
+    RETURN prev_frame
+END
+
+########################################
+# SECTION 10 — OPTIMIZATION FEATURES
+########################################
+
+# Inline caching for method lookups
+STRUCT InlineCache:
+    class     : Class*              # Last seen class
+    method    : Value               # Cached method
+    miss_count: u16                 # Cache misses
+END
+
+PROCEDURE EXECUTE_GETMETHOD_CACHED(frame: Frame*, instr: u32, cache: InlineCache*):
+    dest := GET_DEST(instr)
+    obj_reg := GET_SRC1(instr)
+    name_reg := GET_SRC2(instr)
+    
+    obj := REG(frame, obj_reg)
+    class := GET_CLASS(obj)
+    
+    # Check cache
+    IF cache->class == class:
+        # Cache hit!
+        SET_REG(frame, dest, cache->method)
+        RETURN
+    END
+    
+    # Cache miss
+    cache->miss_count++
+    
+    # Lookup method
+    name := REG(frame, name_reg)
+    method := LOOKUP_METHOD(class, name)
+    
+    # Update cache if stable
+    IF cache->miss_count < 10:
+        cache->class := class
+        cache->method := method
+    END
+    
+    SET_REG(frame, dest, method)
+END
+
+# Trace-based optimization hints
+STRUCT TraceInfo:
+    hot_loops : ARRAY<LoopInfo>     # Frequently executed loops
+    hot_calls : ARRAY<CallSite>     # Frequently called functions
+END
+
+PROCEDURE RECORD_LOOP_ITERATION(trace: TraceInfo*, pc: u32):
+    loop := FIND_LOOP_AT_PC(trace, pc)
+    IF loop != nil:
+        loop->iterations++
+        IF loop->iterations > HOT_THRESHOLD:
+            MARK_FOR_OPTIMIZATION(loop)
+        END
+    END
+END
+
+########################################
+# SECTION 11 — INITIALIZATION
+########################################
+
+FUNCTION VM_INIT() RETURNS VMState*:
+    vm := ALLOC(VMState)
+    
+    # Initialize subsystems
+    SCHEDULER_INIT()
+    vm->threads := g_scheduler
+    
+    vm->heap := HEAP_INIT(HEAP_SIZE)
+    vm->gc_threshold := GC_THRESHOLD
+    
+    vm->strings := STRING_TABLE_INIT()
+    vm->globals := HASH_TABLE_INIT()
+    vm->modules := HASH_TABLE_INIT()
+    
+    # Initialize primitive classes
+    INIT_METACLASS_HIERARCHY()
+    INIT_PRIMITIVE_CLASSES()
+    
+    RETURN vm
+END
+
+FUNCTION VM_LOAD_MODULE(vm: VMState*, bytecode: ARRAY<u8>) RETURNS Module*:
+    # Parse bytecode format
+    reader := BytecodeReader{data: bytecode, pos: 0}
+    
+    module := ALLOC(Module)
+    module->name := READ_STRING(&reader)
+    
+    # Read constant pool
+    const_count := READ_U32(&reader)
+    module->constants := ALLOC_ARRAY(Value, const_count)
+    FOR i := 0 TO const_count - 1:
+        module->constants[i] := READ_CONSTANT(&reader)
+    END
+    
+    # Read function prototypes
+    proto_count := READ_U32(&reader)
+    module->protos := ALLOC_ARRAY(Proto*, proto_count)
+    FOR i := 0 TO proto_count - 1:
+        module->protos[i] := READ_PROTO(&reader, module)
+    END
+    
+    # Initialize module globals
+    module->globals := HASH_TABLE_INIT()
+    
+    # Register module
+    HASH_TABLE_SET(vm->modules, module->name, module)
+    
+    RETURN module
+END
+
+########################################
+# SECTION 12 — EXAMPLE BYTECODE
+########################################
+
+# Example: Fibonacci with memoization
+# def fib(n):
+#     if n <= 1:
+#         return n
+#     return fib(n-1) + fib(n-2)
+
+FUNCTION EXAMPLE_FIB_BYTECODE() RETURNS ARRAY<u32>:
+    RETURN [
+        # Entry: r0 = parameter n
+        MAKE_INSTR(OP_LOADK, 1, 0, 0),      # r1 = 1
+        MAKE_INSTR(OP_LE, 2, 0, 1),         # r2 = n <= 1
+        MAKE_INSTR(OP_JMPIF, 2, 0, 3),      # if r2 goto return_n
+        
+        # Recursive case
+        MAKE_INSTR(OP_SUB, 3, 0, 1),        # r3 = n - 1
+        MAKE_INSTR(OP_MOVE, 4, 0, 0),       # r4 = self (closure)
+        MAKE_INSTR(OP_CALL, 4, 1, 1),       # r4 = fib(n-1)
+        
+        MAKE_INSTR(OP_LOADK, 5, 0, 1),      # r5 = 2
+        MAKE_INSTR(OP_SUB, 6, 0, 5),        # r6 = n - 2
+        MAKE_INSTR(OP_MOVE, 7, 0, 0),       # r7 = self
+        MAKE_INSTR(OP_CALL, 7, 1, 1),       # r7 = fib(n-2)
+        
+        MAKE_INSTR(OP_ADD, 8, 4, 7),        # r8 = r4 + r7
+        MAKE_INSTR(OP_RETURN, 8, 1, 0),     # return r8
+        
+        # return_n:
+        MAKE_INSTR(OP_RETURN, 0, 1, 0),     # return n
+    ]
+END
+
+########################################
+# APPENDIX — DESIGN NOTES
+########################################
+
+# • Register-based design inspired by Lua 5.0 VM
+# • SSA influence through phi nodes and single assignment
+# • Inline caching for dynamic method dispatch
+# • Integrated with green thread scheduler
+# • Upvalue mechanism for proper closure support
+# • Type feedback collection for future JIT compilation
+# • Exception handling with try/catch/finally
+# • Module system with separate compilation
+# • Concurrent message passing primitives
+

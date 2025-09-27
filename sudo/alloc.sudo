@@ -1,0 +1,559 @@
+LANGUAGE = "pseudocode"        # ← Diyrbal memory allocator in Sudolang
+
+############################################################
+#  DIYRBAL ARENA-BASED MEMORY ALLOCATOR                   #
+#  Focus: fast bump allocation, minimal fragmentation      #
+############################################################
+
+########################################
+# SECTION 0 — DESIGN PHILOSOPHY & GOALS
+########################################
+#  • Arena allocator with configurable block size
+#  • No individual object deallocation (free entire arena)
+#  • Alignment-aware allocation
+#  • Zero-initialization option
+#  • Statistics tracking for GC pressure analysis
+#  • Thread-local arenas with optional sharing
+#  • Memory mapped arena extension support
+
+CONST DEFAULT_ARENA_SIZE = 1048576    # 1 MiB default arena
+CONST MIN_ARENA_SIZE     = 65536      # 64 KiB minimum
+CONST ALIGNMENT_8        = 8          # default alignment
+CONST ALIGNMENT_16       = 16         # for SIMD types
+CONST ALIGNMENT_PAGE     = 4096       # page alignment
+CONST POISON_BYTE        = 0xDE       # debug: freed memory marker
+CONST CANARY_VALUE       = 0xDEADBEEF # debug: overflow detection
+
+# Allocation flags:
+CONST ALLOC_ZERO        = 0x01   # zero-initialize
+CONST ALLOC_EXECUTABLE  = 0x02   # for JIT code
+CONST ALLOC_ATOMIC      = 0x04   # GC atomic (no pointers)
+CONST ALLOC_FINALIZER   = 0x08   # has finalizer
+CONST ALLOC_PINNED      = 0x10   # cannot move (for FFI)
+
+######################################
+# SECTION 1 — CORE DATA STRUCTURES
+######################################
+
+STRUCT ArenaBlock:
+    data      : ptr[u8]      # actual memory
+    size      : usize        # total size
+    used      : usize        # bytes allocated
+    next      : ptr[ArenaBlock]  # linked list
+    prev      : ptr[ArenaBlock]
+    
+    # Memory protection & debugging:
+    protected : bool         # mprotect()'ed
+    canary    : u32         # overflow detection
+END
+
+STRUCT Arena:
+    name      : string      # for debugging
+    id        : u64         # unique arena ID
+    
+    # Block management:
+    first_block   : ptr[ArenaBlock]
+    current_block : ptr[ArenaBlock]
+    block_size    : usize   # default block size
+    total_blocks  : u32
+    
+    # Statistics:
+    total_allocated  : u64  # cumulative bytes allocated
+    total_requested  : u64  # cumulative bytes requested
+    peak_allocated   : u64  # high water mark
+    allocation_count : u64  # number of allocations
+    
+    # Configuration:
+    flags         : u32     # arena-wide flags
+    thread_id     : u64     # owning thread (0 = shared)
+    mutex         : Mutex   # for shared arenas
+    
+    # GC integration:
+    gc_generation : u32     # GC generation this arena belongs to
+    contains_refs : bool    # true if may contain GC references
+END
+
+STRUCT AllocHeader:
+    size     : u32          # allocation size (excluding header)
+    flags    : u16          # allocation flags  
+    gc_bits  : u16          # GC mark bits, age, etc.
+    arena_id : u64          # back-pointer to arena
+    IF DEBUG:
+        file : string       # allocation site
+        line : u32
+        timestamp : u64
+    END
+END
+
+# Global allocator state:
+STRUCT AllocatorState:
+    # Arena registry:
+    all_arenas     : HashTable[u64, ptr[Arena]]
+    arena_id_counter : AtomicU64
+    
+    # Thread-local arena cache:
+    tls_arena_key  : ThreadLocalKey
+    
+    # Memory limits:
+    memory_limit   : usize      # 0 = unlimited
+    memory_used    : AtomicU64
+    
+    # Allocation hooks:
+    oom_handler    : FnPtr      # out-of-memory callback
+    alloc_hook     : FnPtr      # allocation tracking
+    
+    IF STATS:
+        histogram  : Array[64, u64]  # size distribution
+        type_stats : HashTable[string, AllocStats]
+    END
+END
+
+GLOBAL ALLOCATOR : AllocatorState
+
+######################################
+# SECTION 2 — ARENA LIFECYCLE
+######################################
+
+FUNCTION CreateArena(name: string, block_size: usize, flags: u32) RETURNS ptr[Arena]:
+    # Validate and adjust block size
+    IF block_size < MIN_ARENA_SIZE:
+        block_size := MIN_ARENA_SIZE
+    END
+    block_size := ALIGN_UP(block_size, ALIGNMENT_PAGE)
+    
+    # Create arena struct (bootstrap with system malloc)
+    arena := SYSTEM_MALLOC(sizeof(Arena)) AS ptr[Arena]
+    IF arena == null:
+        RETURN null
+    END
+    
+    # Initialize arena
+    arena.name := name
+    arena.id := ATOMIC_INCREMENT(ALLOCATOR.arena_id_counter)
+    arena.first_block := null
+    arena.current_block := null
+    arena.block_size := block_size
+    arena.total_blocks := 0
+    arena.total_allocated := 0
+    arena.total_requested := 0
+    arena.peak_allocated := 0
+    arena.allocation_count := 0
+    arena.flags := flags
+    arena.thread_id := GET_THREAD_ID()
+    arena.gc_generation := 0
+    arena.contains_refs := true
+    
+    IF (flags AND ALLOC_ATOMIC) != 0:
+        arena.contains_refs := false
+    END
+    
+    # Create initial block
+    first_block := AllocateArenaBlock(arena, block_size)
+    IF first_block == null:
+        SYSTEM_FREE(arena)
+        RETURN null
+    END
+    
+    arena.first_block := first_block
+    arena.current_block := first_block
+    
+    # Register arena globally
+    MUTEX_LOCK(ALLOCATOR.all_arenas.mutex)
+    ALLOCATOR.all_arenas[arena.id] := arena
+    MUTEX_UNLOCK(ALLOCATOR.all_arenas.mutex)
+    
+    # Set as thread-local if not shared
+    IF arena.thread_id != 0:
+        SET_THREAD_LOCAL(ALLOCATOR.tls_arena_key, arena)
+    END
+    
+    RETURN arena
+END
+
+FUNCTION AllocateArenaBlock(arena: ptr[Arena], size: usize) RETURNS ptr[ArenaBlock]:
+    # Check memory limit
+    new_total := ATOMIC_LOAD(ALLOCATOR.memory_used) + size
+    IF ALLOCATOR.memory_limit > 0 AND new_total > ALLOCATOR.memory_limit:
+        IF ALLOCATOR.oom_handler != null:
+            ALLOCATOR.oom_handler(size)
+        END
+        RETURN null
+    END
+    
+    # Allocate block + header as single allocation
+    total_size := sizeof(ArenaBlock) + size
+    memory := MMAP_ANONYMOUS(total_size, PROT_READ | PROT_WRITE)
+    IF memory == null:
+        RETURN null
+    END
+    
+    # Initialize block header
+    block := memory AS ptr[ArenaBlock]
+    block.data := (memory + sizeof(ArenaBlock)) AS ptr[u8]
+    block.size := size
+    block.used := 0
+    block.next := null
+    block.prev := arena.current_block
+    block.protected := false
+    block.canary := CANARY_VALUE
+    
+    # Link into arena
+    IF arena.current_block != null:
+        arena.current_block.next := block
+    END
+    
+    # Update accounting
+    ATOMIC_ADD(ALLOCATOR.memory_used, size)
+    arena.total_blocks += 1
+    
+    IF DEBUG:
+        MEMSET(block.data, POISON_BYTE, size)
+    END
+    
+    RETURN block
+END
+
+FUNCTION DestroyArena(arena: ptr[Arena]):
+    IF arena == null:
+        RETURN
+    END
+    
+    # Remove from thread-local if current
+    IF arena.thread_id != 0:
+        current_tls := GET_THREAD_LOCAL(ALLOCATOR.tls_arena_key)
+        IF current_tls == arena:
+            SET_THREAD_LOCAL(ALLOCATOR.tls_arena_key, null)
+        END
+    END
+    
+    # Unregister globally
+    MUTEX_LOCK(ALLOCATOR.all_arenas.mutex)
+    DELETE ALLOCATOR.all_arenas[arena.id]
+    MUTEX_UNLOCK(ALLOCATOR.all_arenas.mutex)
+    
+    # Free all blocks
+    block := arena.first_block
+    WHILE block != null:
+        next := block.next
+        size := block.size
+        
+        # Poison memory in debug mode
+        IF DEBUG:
+            MEMSET(block.data, POISON_BYTE, size)
+            block.canary := 0
+        END
+        
+        total_size := sizeof(ArenaBlock) + size
+        MUNMAP(block AS ptr[u8], total_size)
+        ATOMIC_SUB(ALLOCATOR.memory_used, size)
+        
+        block := next
+    END
+    
+    # Clear and free arena struct
+    MEMSET(arena, 0, sizeof(Arena))
+    SYSTEM_FREE(arena)
+END
+
+######################################
+# SECTION 3 — ALLOCATION INTERFACE
+######################################
+
+FUNCTION ArenaAlloc(arena: ptr[Arena], size: usize, align: usize, flags: u32) RETURNS ptr[void]:
+    IF arena == null OR size == 0:
+        RETURN null
+    END
+    
+    # Add header space
+    header_size := sizeof(AllocHeader)
+    total_size := ALIGN_UP(header_size + size, align)
+    
+    # Thread safety for shared arenas
+    IF arena.thread_id == 0:
+        MUTEX_LOCK(arena.mutex)
+    END
+    
+    # Find space in current block
+    block := arena.current_block
+    aligned_used := ALIGN_UP(block.used, align)
+    
+    IF aligned_used + total_size > block.size:
+        # Need new block
+        new_size := MAX(total_size, arena.block_size)
+        new_block := AllocateArenaBlock(arena, new_size)
+        IF new_block == null:
+            IF arena.thread_id == 0:
+                MUTEX_UNLOCK(arena.mutex)
+            END
+            RETURN null
+        END
+        arena.current_block := new_block
+        block := new_block
+        aligned_used := 0
+    END
+    
+    # Allocate from block
+    header_ptr := (block.data + aligned_used) AS ptr[AllocHeader]
+    user_ptr := (header_ptr + 1) AS ptr[void]
+    
+    # Fill header
+    header_ptr.size := size
+    header_ptr.flags := flags
+    header_ptr.gc_bits := 0
+    header_ptr.arena_id := arena.id
+    
+    IF DEBUG:
+        header_ptr.file := GET_CALLER_FILE()
+        header_ptr.line := GET_CALLER_LINE()
+        header_ptr.timestamp := GET_TIMESTAMP()
+    END
+    
+    # Update block usage
+    block.used := aligned_used + total_size
+    
+    # Update statistics
+    arena.total_allocated += total_size
+    arena.total_requested += size
+    arena.allocation_count += 1
+    IF arena.total_allocated > arena.peak_allocated:
+        arena.peak_allocated := arena.total_allocated
+    END
+    
+    # Zero-initialize if requested
+    IF (flags AND ALLOC_ZERO) != 0:
+        MEMSET(user_ptr, 0, size)
+    END
+    
+    # Mark pages executable if needed
+    IF (flags AND ALLOC_EXECUTABLE) != 0:
+        page_start := ALIGN_DOWN(user_ptr AS usize, ALIGNMENT_PAGE)
+        page_end := ALIGN_UP((user_ptr AS usize) + size, ALIGNMENT_PAGE)
+        MPROTECT(page_start AS ptr[void], page_end - page_start, PROT_READ | PROT_WRITE | PROT_EXEC)
+    END
+    
+    IF arena.thread_id == 0:
+        MUTEX_UNLOCK(arena.mutex)
+    END
+    
+    # Call allocation hook
+    IF ALLOCATOR.alloc_hook != null:
+        ALLOCATOR.alloc_hook(arena.id, user_ptr, size, flags)
+    END
+    
+    # Update size histogram
+    IF STATS:
+        bucket := LOG2(size)
+        IF bucket > 63: bucket := 63
+        ATOMIC_INCREMENT(ALLOCATOR.histogram[bucket])
+    END
+    
+    RETURN user_ptr
+END
+
+# Convenience wrappers:
+FUNCTION ArenaAllocType[T](arena: ptr[Arena], flags: u32 = 0) RETURNS ptr[T]:
+    ptr := ArenaAlloc(arena, sizeof(T), alignof(T), flags OR ALLOC_ZERO)
+    RETURN ptr AS ptr[T]
+END
+
+FUNCTION ArenaAllocArray[T](arena: ptr[Arena], count: usize, flags: u32 = 0) RETURNS ptr[T]:
+    size := sizeof(T) * count
+    ptr := ArenaAlloc(arena, size, alignof(T), flags OR ALLOC_ZERO)
+    RETURN ptr AS ptr[T]
+END
+
+FUNCTION ArenaAllocString(arena: ptr[Arena], str: string) RETURNS ptr[char]:
+    len := STRLEN(str) + 1  # include null terminator
+    dst := ArenaAlloc(arena, len, 1, 0) AS ptr[char]
+    IF dst != null:
+        MEMCPY(dst, str, len)
+    END
+    RETURN dst
+END
+
+######################################
+# SECTION 4 — ARENA UTILITIES
+######################################
+
+FUNCTION ArenaReset(arena: ptr[Arena]):
+    # Reset all blocks to unused state
+    block := arena.first_block
+    WHILE block != null:
+        block.used := 0
+        IF DEBUG:
+            MEMSET(block.data, POISON_BYTE, block.size)
+        END
+        block := block.next
+    END
+    
+    arena.current_block := arena.first_block
+    arena.total_allocated := 0
+    # Note: total_requested and allocation_count are cumulative
+END
+
+FUNCTION ArenaShrinkToFit(arena: ptr[Arena]):
+    # Free all blocks except first
+    IF arena.first_block == null:
+        RETURN
+    END
+    
+    block := arena.first_block.next
+    WHILE block != null:
+        next := block.next
+        size := block.size
+        
+        total_size := sizeof(ArenaBlock) + size
+        MUNMAP(block AS ptr[u8], total_size)
+        ATOMIC_SUB(ALLOCATOR.memory_used, size)
+        arena.total_blocks -= 1
+        
+        block := next
+    END
+    
+    arena.first_block.next := null
+    arena.current_block := arena.first_block
+END
+
+FUNCTION GetAllocHeader(ptr: ptr[void]) RETURNS ptr[AllocHeader]:
+    IF ptr == null:
+        RETURN null
+    END
+    RETURN ((ptr AS ptr[AllocHeader]) - 1)
+END
+
+FUNCTION GetAllocSize(ptr: ptr[void]) RETURNS usize:
+    header := GetAllocHeader(ptr)
+    IF header == null:
+        RETURN 0
+    END
+    RETURN header.size
+END
+
+FUNCTION GetAllocArena(ptr: ptr[void]) RETURNS ptr[Arena]:
+    header := GetAllocHeader(ptr)
+    IF header == null:
+        RETURN null
+    END
+    RETURN ALLOCATOR.all_arenas[header.arena_id]
+END
+
+######################################
+# SECTION 5 — MEMORY PROTECTION & DEBUG
+######################################
+
+FUNCTION ArenaProtect(arena: ptr[Arena], protection: i32):
+    # Apply memory protection to all blocks
+    block := arena.first_block
+    WHILE block != null:
+        IF MPROTECT(block.data, block.size, protection) == 0:
+            block.protected := true
+        END
+        block := block.next
+    END
+END
+
+FUNCTION ArenaCheckIntegrity(arena: ptr[Arena]) RETURNS bool:
+    ok := true
+    
+    # Check arena fields
+    IF arena.current_block == null OR arena.first_block == null:
+        PRINT("Arena ${arena.name}: null block pointers")
+        ok := false
+    END
+    
+    # Walk all blocks
+    block_count := 0
+    total_size := 0
+    block := arena.first_block
+    
+    WHILE block != null:
+        block_count += 1
+        
+        # Check canary
+        IF block.canary != CANARY_VALUE:
+            PRINT("Arena ${arena.name}: corrupted canary in block ${block_count}")
+            ok := false
+        END
+        
+        # Check used <= size
+        IF block.used > block.size:
+            PRINT("Arena ${arena.name}: used > size in block ${block_count}")
+            ok := false
+        END
+        
+        # Check linked list consistency
+        IF block.next != null AND block.next.prev != block:
+            PRINT("Arena ${arena.name}: broken linked list at block ${block_count}")
+            ok := false
+        END
+        
+        total_size += block.size
+        block := block.next
+    END
+    
+    # Check block count
+    IF block_count != arena.total_blocks:
+        PRINT("Arena ${arena.name}: block count mismatch")
+        ok := false
+    END
+    
+    RETURN ok
+END
+
+IF STATS:
+    FUNCTION PrintArenaStats(arena: ptr[Arena]):
+        utilization := 0.0
+        IF arena.total_allocated > 0:
+            # Calculate actual memory usage vs allocated
+            total_block_size := 0
+            block := arena.first_block
+            WHILE block != null:
+                total_block_size += block.size
+                block := block.next
+            END
+            utilization := (arena.total_requested AS f64) / (total_block_size AS f64) * 100.0
+        END
+        
+        PRINT("Arena '${arena.name}' (ID: ${arena.id}):")
+        PRINT("  Blocks: ${arena.total_blocks}")
+        PRINT("  Total allocated: ${arena.total_allocated}")
+        PRINT("  Total requested: ${arena.total_requested}")
+        PRINT("  Peak allocated: ${arena.peak_allocated}")
+        PRINT("  Allocations: ${arena.allocation_count}")
+        PRINT("  Utilization: ${utilization}%")
+        PRINT("  Thread: ${arena.thread_id}")
+        PRINT("  GC gen: ${arena.gc_generation}")
+    END
+    
+    FUNCTION PrintGlobalAllocStats():
+        PRINT("Global Allocator Statistics:")
+        PRINT("  Total memory: ${ALLOCATOR.memory_used}")
+        PRINT("  Memory limit: ${ALLOCATOR.memory_limit}")
+        PRINT("  Active arenas: ${ALLOCATOR.all_arenas.size}")
+        
+        # Print size histogram
+        PRINT("\nSize distribution:")
+        FOR i IN 0..63:
+            count := ALLOCATOR.histogram[i]
+            IF count > 0:
+                min_size := (1 << i)
+                max_size := (1 << (i+1)) - 1
+                PRINT("  [${min_size}..${max_size}]: ${count}")
+            END
+        END
+    END
+END
+
+######################################
+# SECTION 6 — THREAD-LOCAL ALLOCATION
+######################################
+
+FUNCTION GetThreadArena() RETURNS ptr[Arena]:
+    arena := GET_THREAD_LOCAL(ALLOCATOR.tls_arena_key) AS ptr[Arena]
+    IF arena == null:
+        # Create new thread-local arena
+        name := "thread_" + TO_STRING(GET_THREAD_ID())
+        arena := CreateArena(name, DEFAULT_ARENA_SIZE, 0)
+        SET_THREAD_LOCAL(ALLOCATOR.tls_arena_key, arena)
+    END
+

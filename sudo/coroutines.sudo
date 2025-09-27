@@ -1,0 +1,857 @@
+LANGUAGE = "sudolang"
+
+############################################################
+#  DIYRBAL COROUTINE SYSTEM                               #
+#  Asymmetric stackful coroutines built on Green Threads  #
+############################################################
+
+########################################
+# SECTION 0 — CONSTANTS & TYPES
+########################################
+
+# Coroutine states
+CONST CORO_SUSPENDED  = 0    # Initial state or after yield
+CONST CORO_RUNNING    = 1    # Currently executing
+CONST CORO_NORMAL     = 2    # Resumed another coroutine
+CONST CORO_DEAD       = 3    # Finished execution
+
+# Coroutine types
+CONST CORO_MAIN       = 0    # Main program coroutine
+CONST CORO_USER       = 1    # User-created coroutine
+CONST CORO_GENERATOR  = 2    # Generator-style coroutine
+
+# Limits
+CONST MAX_CORO_DEPTH  = 64   # Maximum resume chain depth
+CONST CORO_STACK_SIZE = 64 * 1024  # 64KB default stack
+
+# Error codes
+CONST CORO_ERR_DEAD   = 1    # Attempted to resume dead coroutine
+CONST CORO_ERR_RUNNING = 2   # Attempted to resume running coroutine
+CONST CORO_ERR_YIELD_MAIN = 3  # Cannot yield from main
+CONST CORO_ERR_DEPTH  = 4    # Resume chain too deep
+
+########################################
+# SECTION 1 — CORE STRUCTURES
+########################################
+
+STRUCT Coroutine:
+    # Identity
+    id          : u64               # Unique coroutine ID
+    type        : u8                # Coroutine type
+    state       : u8                # Current state
+    
+    # Execution context
+    thread      : GreenThread*      # Underlying green thread
+    entry       : Function*         # Entry point function
+    
+    # Coroutine chain
+    caller      : Coroutine*        # Who resumed us
+    depth       : u32               # Resume chain depth
+    
+    # Values
+    yield_value : Value             # Last yielded value
+    resume_value: Value             # Value passed to resume
+    error       : Value             # Error if any
+    
+    # Generator support
+    generator   : GeneratorState*   # Generator-specific state
+    
+    # GC and metadata
+    gc_header   : GCHeader          # For garbage collection
+    name        : String*           # Debug name
+    source_info : SourceLocation    # Where created
+END
+
+STRUCT GeneratorState:
+    # Generator-specific extensions
+    send_value  : Value             # Value sent via send()
+    return_value: Value             # Value from return
+    
+    # Iteration protocol
+    iter_count  : u64               # Number of iterations
+    exhausted   : bool              # Generator exhausted
+    
+    # Close/finalize support
+    finalizer   : Function*         # Cleanup function
+    closed      : bool              # Explicitly closed
+END
+
+STRUCT CoroutineSystem:
+    # Global coroutine state
+    coroutines  : Map<u64, Coroutine*>  # All coroutines
+    current     : Coroutine*        # Currently running
+    main        : Coroutine*        # Main coroutine
+    
+    # ID generation
+    next_id     : u64               # Next coroutine ID
+    
+    # Thread pool integration
+    scheduler   : GreenScheduler*   # Green thread scheduler
+    
+    # Statistics
+    stats       : CoroStats         # Performance metrics
+END
+
+########################################
+# SECTION 2 — COROUTINE CREATION
+########################################
+
+FUNCTION CORO_CREATE(vm: VM*, func: Function*, name: String*) 
+    RETURNS Coroutine*:
+    
+    system := vm->coro_system
+    
+    # Allocate coroutine object
+    coro := GC_ALLOC(Coroutine)
+    coro->id := system->next_id++
+    coro->type := CORO_USER
+    coro->state := CORO_SUSPENDED
+    coro->entry := func
+    coro->name := name
+    coro->depth := 0
+    
+    # Create underlying green thread
+    thread := GREEN_THREAD_CREATE(
+        CORO_THREAD_MAIN,
+        coro AS void*,
+        CORO_STACK_SIZE
+    )
+    
+    coro->thread := thread
+    
+    # Register with system
+    MAP_SET(system->coroutines, coro->id, coro)
+    
+    system->stats.created++
+    
+    RETURN coro
+END
+
+FUNCTION CORO_THREAD_MAIN(arg: void*):
+    # Entry point for coroutine's green thread
+    coro := arg AS Coroutine*
+    vm := CURRENT_VM()
+    
+    # Wait for initial resume
+    GREEN_THREAD_PARK()
+    
+    # Set as current coroutine
+    prev := vm->coro_system->current
+    vm->coro_system->current := coro
+    
+    TRY:
+        # Call coroutine function with resume value
+        result := CALL_FUNCTION(
+            vm,
+            coro->entry,
+            [coro->resume_value]
+        )
+        
+        # Coroutine returned normally
+        coro->yield_value := result
+        coro->state := CORO_DEAD
+        
+    CATCH error:
+        # Coroutine threw exception
+        coro->error := error
+        coro->state := CORO_DEAD
+        
+    FINALLY:
+        # Clean up generator state if needed
+        IF coro->generator != nil:
+            GENERATOR_FINALIZE(coro->generator)
+        END
+        
+        # Return to caller
+        vm->coro_system->current := prev
+        IF coro->caller != nil:
+            GREEN_THREAD_UNPARK(coro->caller->thread)
+        END
+    END
+END
+
+FUNCTION CORO_CREATE_GENERATOR(vm: VM*, func: Function*) 
+    RETURNS Coroutine*:
+    
+    coro := CORO_CREATE(vm, func, STRING("generator"))
+    coro->type := CORO_GENERATOR
+    
+    # Initialize generator state
+    gen := GC_ALLOC(GeneratorState)
+    gen->iter_count := 0
+    gen->exhausted := false
+    gen->closed := false
+    
+    coro->generator := gen
+    
+    RETURN coro
+END
+
+########################################
+# SECTION 3 — RESUME/YIELD OPERATIONS
+########################################
+
+FUNCTION CORO_RESUME(vm: VM*, coro: Coroutine*, value: Value) 
+    RETURNS CoroutineResult:
+    
+    system := vm->coro_system
+    current := system->current
+    
+    # Validate state
+    IF coro->state == CORO_DEAD:
+        RETURN CoroutineResult{
+            success: false,
+            error: CREATE_ERROR(CORO_ERR_DEAD, "coroutine is dead")
+        }
+    END
+    
+    IF coro->state == CORO_RUNNING:
+        RETURN CoroutineResult{
+            success: false,
+            error: CREATE_ERROR(CORO_ERR_RUNNING, "coroutine already running")
+        }
+    END
+    
+    # Check resume depth
+    IF current->depth >= MAX_CORO_DEPTH:
+        RETURN CoroutineResult{
+            success: false,
+            error: CREATE_ERROR(CORO_ERR_DEPTH, "coroutine chain too deep")
+        }
+    END
+    
+    # Set up coroutine chain
+    coro->caller := current
+    coro->depth := current->depth + 1
+    coro->resume_value := value
+    
+    # Update states
+    coro->state := CORO_RUNNING
+    current->state := CORO_NORMAL
+    
+    # Perform context switch via green threads
+    GREEN_THREAD_UNPARK(coro->thread)
+    GREEN_THREAD_PARK()  # Wait for coroutine to yield back
+    
+    # Restore state
+    current->state := CORO_RUNNING
+    
+    # Check if coroutine died with error
+    IF coro->state == CORO_DEAD AND coro->error.type != TYPE_NIL:
+        RETURN CoroutineResult{
+            success: false,
+            error: coro->error
+        }
+    END
+    
+    # Return yielded/returned value
+    RETURN CoroutineResult{
+        success: true,
+        value: coro->yield_value,
+        done: coro->state == CORO_DEAD
+    }
+END
+
+FUNCTION CORO_YIELD(vm: VM*, value: Value) RETURNS Value:
+    system := vm->coro_system
+    current := system->current
+    
+    # Cannot yield from main
+    IF current->type == CORO_MAIN:
+        THROW_ERROR(CORO_ERR_YIELD_MAIN, "cannot yield from main")
+    END
+    
+    # Save yield value
+    current->yield_value := value
+    current->state := CORO_SUSPENDED
+    
+    # Get caller to resume
+    caller := current->caller
+    IF caller == nil:
+        # No caller, return to scheduler
+        GREEN_THREAD_YIELD()
+        RETURN current->resume_value
+    END
+    
+    # Clear caller link
+    current->caller := nil
+    current->depth := 0
+    
+    # Switch to caller
+    system->current := caller
+    caller->state := CORO_RUNNING
+    
+    # Context switch
+    GREEN_THREAD_UNPARK(caller->thread)
+    GREEN_THREAD_PARK()  # Wait to be resumed again
+    
+    # We've been resumed, return the resume value
+    RETURN current->resume_value
+END
+
+########################################
+# SECTION 4 — GENERATOR PROTOCOL
+########################################
+
+FUNCTION GENERATOR_NEXT(vm: VM*, gen: Coroutine*) RETURNS Value:
+    IF gen->type != CORO_GENERATOR:
+        THROW_ERROR(TYPE_ERROR, "not a generator")
+    END
+    
+    IF gen->generator->exhausted:
+        THROW_ERROR(STOP_ITERATION, "generator exhausted")
+    END
+    
+    # Resume with nil
+    result := CORO_RESUME(vm, gen, NIL_VALUE)
+    
+    IF NOT result.success:
+        # Check for StopIteration
+        IF IS_STOP_ITERATION(result.error):
+            gen->generator->exhausted := true
+            gen->generator->return_value := GET_STOP_ITERATION_VALUE(result.error)
+            THROW(result.error)
+        END
+        
+        # Other error
+        THROW(result.error)
+    END
+    
+    # Update iteration count
+    gen->generator->iter_count++
+    
+    # Check if generator finished
+    IF result.done:
+        gen->generator->exhausted := true
+        THROW_STOP_ITERATION(result.value)
+    END
+    
+    RETURN result.value
+END
+
+FUNCTION GENERATOR_SEND(vm: VM*, gen: Coroutine*, value: Value) 
+    RETURNS Value:
+    
+    IF gen->type != CORO_GENERATOR:
+        THROW_ERROR(TYPE_ERROR, "not a generator")
+    END
+    
+    IF gen->generator->exhausted:
+        THROW_ERROR(STOP_ITERATION, "generator exhausted")
+    END
+    
+    # First send must be nil
+    IF gen->generator->iter_count == 0 AND value.type != TYPE_NIL:
+        THROW_ERROR(TYPE_ERROR, "first send() must be None")
+    END
+    
+    # Resume with sent value
+    gen->generator->send_value := value
+    result := CORO_RESUME(vm, gen, value)
+    
+    # Handle result same as next()
+    IF NOT result.success:
+        IF IS_STOP_ITERATION(result.error):
+            gen->generator->exhausted := true
+            gen->generator->return_value := GET_STOP_ITERATION_VALUE(result.error)
+        END
+        THROW(result.error)
+    END
+    
+    gen->generator->iter_count++
+    
+    IF result.done:
+        gen->generator->exhausted := true
+        THROW_STOP_ITERATION(result.value)
+    END
+    
+    RETURN result.value
+END
+
+FUNCTION GENERATOR_CLOSE(vm: VM*, gen: Coroutine*):
+    IF gen->type != CORO_GENERATOR:
+        THROW_ERROR(TYPE_ERROR, "not a generator")
+    END
+    
+    IF gen->generator->closed OR gen->state == CORO_DEAD:
+        RETURN  # Already closed
+    END
+    
+    # Mark as closed
+    gen->generator->closed := true
+    
+    # If suspended, resume with GeneratorExit
+    IF gen->state == CORO_SUSPENDED:
+        TRY:
+            CORO_RESUME(vm, gen, CREATE_GENERATOR_EXIT())
+        CATCH error:
+            # Ignore GeneratorExit, re-raise others
+            IF NOT IS_GENERATOR_EXIT(error):
+                THROW(error)
+            END
+        END
+    END
+    
+    # Run finalizer if any
+    IF gen->generator->finalizer != nil:
+        CALL_FUNCTION(vm, gen->generator->finalizer, [])
+    END
+    
+    # Mark as dead
+    gen->state := CORO_DEAD
+END
+
+########################################
+# SECTION 5 — COROUTINE SCHEDULING
+########################################
+
+FUNCTION CORO_SCHEDULE(vm: VM*):
+    # Integrate with green thread scheduler
+    system := vm->coro_system
+    
+    # Find ready coroutines
+    ready := List<Coroutine*>()
+    
+    FOR id, coro IN system->coroutines:
+        IF coro->state == CORO_SUSPENDED AND coro->caller == nil:
+            # Top-level suspended coroutine
+            LIST_APPEND(ready, coro)
+        END
+    END
+    
+    # Schedule ready coroutines
+    FOR coro IN ready:
+        GREEN_THREAD_UNPARK(coro->thread)
+    END
+END
+
+FUNCTION CORO_AWAIT(vm: VM*, awaitable: Value) RETURNS Value:
+    # Async/await support via coroutines
+    current := vm->coro_system->current
+    
+    # Check if awaitable is a coroutine
+    IF IS_COROUTINE(awaitable):
+        coro := awaitable.as_pointer AS Coroutine*
+        result := CORO_RESUME(vm, coro, NIL_VALUE)
+        
+        IF result.success:
+            RETURN result.value
+        ELSE:
+            THROW(result.error)
+        END
+    END
+    
+    # Check if awaitable has __await__ method
+    await_method := GET_METHOD(awaitable, "__await__")
+    IF await_method != nil:
+        iter := CALL_METHOD(vm, awaitable, "__await__", [])
+        
+        # Drive the iterator
+        WHILE true:
+            TRY:
+                value := CALL_METHOD(vm, iter, "__next__", [])
+                # Yield the value up
+                value := CORO_YIELD(vm, value)
+                # Send it back to iterator
+                CALL_METHOD(vm, iter, "send", [value])
+            CATCH error:
+                IF IS_STOP_ITERATION(error):
+                    RETURN GET_STOP_ITERATION_VALUE(error)
+                ELSE:
+                    THROW(error)
+                END
+            END
+        END
+    END
+    
+    THROW_ERROR(TYPE_ERROR, "object is not awaitable")
+END
+
+########################################
+# SECTION 6 — JIT INTEGRATION
+########################################
+
+FUNCTION CORO_JIT_SAFE_POINT(vm: VM*, coro: Coroutine*):
+    # Check if we can safely JIT compile across yield points
+    jit := vm->jit_state
+    
+    IF jit->mode == JIT_TRACE_MODE:
+        # Don't trace across coroutine switches
+        IF vm->coro_system->current != coro:
+            ABORT_TRACE(jit->recorder)
+            RETURN
+        END
+        
+        # Mark yield points in trace
+        IF RECORDING_TRACE(jit):
+            RECORD_YIELD_POINT(jit->recorder, vm->pc)
+        END
+    END
+END
+
+FUNCTION CORO_DEOPT_HANDLER(vm: VM*, coro: Coroutine*):
+    # Handle deoptimization in coroutine context
+    
+    # Save coroutine-specific state
+    saved_caller := coro->caller
+    saved_depth := coro->depth
+    
+    # Perform standard deoptimization
+    STANDARD_DEOPT_HANDLER(vm)
+    
+    # Restore coroutine state
+    coro->caller := saved_caller
+    coro->depth := saved_depth
+    
+    # If in generator, update iteration state
+    IF coro->type == CORO_GENERATOR:
+        coro->generator->iter_count++
+    END
+END
+
+########################################
+# SECTION 7 — SYMMETRIC OPERATIONS
+########################################
+
+# Optional symmetric coroutine support
+
+STRUCT SymmetricCoroutine:
+    base        : Coroutine         # Base coroutine
+    
+    # Symmetric transfer
+    transfer_to : Coroutine*        # Target for transfer
+    transfer_value: Value           # Value to transfer
+END
+
+FUNCTION CORO_TRANSFER(vm: VM*, from: Coroutine*, to: Coroutine*, 
+                      value: Value) RETURNS Value:
+    # Symmetric coroutine transfer
+    IF from->state != CORO_RUNNING:
+        THROW_ERROR(STATE_ERROR, "not running")
+    END
+    
+    IF to->state == CORO_DEAD:
+        THROW_ERROR(CORO_ERR_DEAD, "target is dead")
+    END
+    
+    IF to->state == CORO_RUNNING:
+        THROW_ERROR(CORO_ERR_RUNNING, "target already running")
+    END
+    
+    # Save transfer value
+    to->resume_value := value
+    
+    # Update states
+    from->state := CORO_SUSPENDED
+    to->state := CORO_RUNNING
+    
+    # Update current
+    vm->coro_system->current := to
+    
+    # Context switch
+    GREEN_THREAD_UNPARK(to->thread)
+    GREEN_THREAD_PARK()
+    
+    # Return value from other coroutine
+    RETURN from->resume_value
+END
+
+########################################
+# SECTION 8 — COROUTINE CHANNELS
+########################################
+
+STRUCT Channel:
+    # CSP-style channels for coroutines
+    capacity    : u32               # Buffer size (0 = unbuffered)
+    
+    # Data
+    buffer      : CircularBuffer    # Message buffer
+    
+    # Waiting coroutines
+    senders     : Queue<WaitingCoro> # Blocked senders
+    receivers   : Queue<WaitingCoro> # Blocked receivers
+    
+    # State
+    closed      : bool              # Channel closed
+    gc_header   : GCHeader          # GC support
+END
+
+STRUCT WaitingCoro:
+    coro        : Coroutine*        # Waiting coroutine
+    value       : Value             # Value to send (senders only)
+END
+
+FUNCTION CHANNEL_SEND(vm: VM*, chan: Channel*, value: Value):
+    IF chan->closed:
+        THROW_ERROR(CHANNEL_ERROR, "send on closed channel")
+    END
+    
+    # Try to deliver to waiting receiver
+    IF NOT QUEUE_EMPTY(chan->receivers):
+        receiver := QUEUE_POP(chan->receivers)
+        receiver.coro->resume_value := value
+        GREEN_THREAD_UNPARK(receiver.coro->thread)
+        RETURN
+    END
+    
+    # Try to buffer
+    IF chan->capacity > 0 AND NOT BUFFER_FULL(chan->buffer):
+        BUFFER_PUT(chan->buffer, value)
+        RETURN
+    END
+    
+    # Must block
+    current := vm->coro_system->current
+    waiting := WaitingCoro{coro: current, value: value}
+    QUEUE_PUSH(chan->senders, waiting)
+    
+    # Yield until receiver takes value
+    CORO_YIELD(vm, NIL_VALUE)
+    
+    # Check if channel was closed while waiting
+    IF chan->closed:
+        THROW_ERROR(CHANNEL_ERROR, "send on closed channel")
+    END
+END
+
+FUNCTION CHANNEL_RECEIVE(vm: VM*, chan: Channel*) RETURNS Value:
+    # Try buffered values first
+    IF chan->capacity > 0 AND NOT BUFFER_EMPTY(chan->buffer):
+        value := BUFFER_GET(chan->buffer)
+        
+        # Wake a sender if any
+        IF NOT QUEUE_EMPTY(chan->senders):
+            sender := QUEUE_POP(chan->senders)
+            BUFFER_PUT(chan->buffer, sender.value)
+            GREEN_THREAD_UNPARK(sender.coro->thread)
+        END
+        
+        RETURN value
+    END
+    
+    # Try to get from waiting sender
+    IF NOT QUEUE_EMPTY(chan->senders):
+        sender := QUEUE_POP(chan->senders)
+        value := sender.value
+        GREEN_THREAD_UNPARK(sender.coro->thread)
+        RETURN value
+    END
+    
+    # Check if closed
+    IF chan->closed:
+        THROW_ERROR(CHANNEL_ERROR, "receive from closed channel")
+    END
+    
+    # Must block
+    current := vm->coro_system->current
+    waiting := WaitingCoro{coro: current, value: NIL_VALUE}
+    QUEUE_PUSH(chan->receivers, waiting)
+    
+    # Yield until sender provides value
+    value := CORO_YIELD(vm, NIL_VALUE)
+    
+    RETURN value
+END
+
+########################################
+# SECTION 9 — HIGHER-ORDER OPERATIONS
+########################################
+
+FUNCTION CORO_MAP(vm: VM*, f: Function*, coros: List<Coroutine*>) 
+    RETURNS List<Value>:
+    # Map function over coroutine results
+    results := List<Value>()
+    
+    FOR coro IN coros:
+        result := CORO_RESUME(vm, coro, NIL_VALUE)
+        IF result.success:
+            value := CALL_FUNCTION(vm, f, [result.value])
+            LIST_APPEND(results, value)
+        ELSE:
+            THROW(result.error)
+        END
+    END
+    
+    RETURN results
+END
+
+FUNCTION CORO_FILTER(vm: VM*, pred: Function*, gen: Coroutine*) 
+    RETURNS Coroutine*:
+    # Create filtered generator
+    
+    filter_func := FUNCTION(vm: VM*, args: Array<Value>) RETURNS Value:
+        WHILE true:
+            value := GENERATOR_NEXT(vm, gen)
+            IF CALL_FUNCTION(vm, pred, [value]).as_bool:
+                CORO_YIELD(vm, value)
+            END
+        END
+    END
+    
+    RETURN CORO_CREATE_GENERATOR(vm, filter_func)
+END
+
+FUNCTION CORO_COMPOSE(vm: VM*, coros: List<Coroutine*>) 
+    RETURNS Coroutine*:
+    # Pipeline composition of coroutines
+    
+    compose_func := FUNCTION(vm: VM*, args: Array<Value>) RETURNS Value:
+        value := args[0]
+        
+        FOR coro IN coros:
+            result := CORO_RESUME(vm, coro, value)
+            IF result.success:
+                value := result.value
+            ELSE:
+                THROW(result.error)
+            END
+        END
+        
+        RETURN value
+    END
+    
+    RETURN CORO_CREATE(vm, compose_func, STRING("composed"))
+END
+
+########################################
+# SECTION 10 — VM INTEGRATION
+########################################
+
+FUNCTION VM_INIT_COROUTINES(vm: VM*):
+    # Initialize coroutine system
+    system := GC_ALLOC(CoroutineSystem)
+    system->coroutines := MAP_CREATE()
+    system->next_id := 1
+    system->scheduler := vm->green_scheduler
+    
+    # Create main coroutine
+    main := GC_ALLOC(Coroutine)
+    main->id := 0
+    main->type := CORO_MAIN
+    main->state := CORO_RUNNING
+    main->thread := GREEN_THREAD_CURRENT()
+    main->depth := 0
+    
+    system->main := main
+    system->current := main
+    
+    MAP_SET(system->coroutines, 0, main)
+    
+    vm->coro_system := system
+    
+    # Register built-in functions
+    REGISTER_BUILTIN(vm, "coroutine.create", BUILTIN_CORO_CREATE)
+    REGISTER_BUILTIN(vm, "coroutine.resume", BUILTIN_CORO_RESUME)
+    REGISTER_BUILTIN(vm, "coroutine.yield", BUILTIN_CORO_YIELD)
+    REGISTER_BUILTIN(vm, "coroutine.status", BUILTIN_CORO_STATUS)
+    REGISTER_BUILTIN(vm, "coroutine.running", BUILTIN_CORO_RUNNING)
+    REGISTER_BUILTIN(vm, "coroutine.wrap", BUILTIN_CORO_WRAP)
+END
+
+# Built-in function implementations
+
+FUNCTION BUILTIN_CORO_CREATE(vm: VM*, args: Array<Value>) RETURNS Value:
+    IF args.length != 1:
+        THROW_ERROR(ARITY_ERROR, "expected 1 argument")
+    END
+    
+    IF args[0].type != TYPE_FUNCTION:
+        THROW_ERROR(TYPE_ERROR, "expected function")
+    END
+    
+    func := args[0].as_pointer AS Function*
+    coro := CORO_CREATE(vm, func, func->name)
+    
+    RETURN CREATE_CORO_VALUE(coro)
+END
+
+FUNCTION BUILTIN_CORO_YIELD(vm: VM*, args: Array<Value>) RETURNS Value:
+    value := NIL_VALUE
+    IF args.length > 0:
+        value := args[0]
+    END
+    
+    RETURN CORO_YIELD(vm, value)
+END
+
+########################################
+# SECTION 11 — STATISTICS
+########################################
+
+STRUCT CoroStats:
+    created     : u64               # Coroutines created
+    resumed     : u64               # Resume operations
+    yielded     : u64               # Yield operations
+    
+    # Errors
+    dead_resume : u64               # Resume dead coroutine
+    depth_exceed: u64               # Max depth exceeded
+    
+    # Channels
+    chan_sends  : u64               # Channel sends
+    chan_recvs  : u64               # Channel receives
+    chan_blocks : u64               # Blocking operations
+END
+
+FUNCTION CORO_PRINT_STATS(stats: CoroStats*):
+    PRINT("=== Coroutine Statistics ===")
+    PRINT("Coroutines: created=%llu", stats->created)
+    PRINT("Operations: resume=%llu yield=%llu", 
+          stats->resumed, stats->yielded)
+    PRINT("Errors: dead=%llu depth=%llu",
+          stats->dead_resume, stats->depth_exceed)
+    PRINT("Channels: sends=%llu recvs=%llu blocks=%llu",
+          stats->chan_sends, stats->chan_recvs, stats->chan_blocks)
+END
+
+########################################
+# APPENDIX — COROUTINE EXAMPLES
+########################################
+
+# Example: Producer-consumer with channels
+EXAMPLE_PRODUCER_CONSUMER:
+    chan := CHANNEL_CREATE(10)  # Buffered channel
+    
+    producer := CORO_CREATE(vm, FUNCTION():
+        FOR i := 1 TO 100:
+            CHANNEL_SEND(vm, chan, CREATE_INT(i))
+            IF i % 10 == 0:
+                CORO_YIELD(vm, NIL_VALUE)  # Cooperative
+            END
+        END
+        CHANNEL_CLOSE(chan)
+    END)
+    
+    consumer := CORO_CREATE(vm, FUNCTION():
+        sum := 0
+        TRY:
+            WHILE true:
+                value := CHANNEL_RECEIVE(vm, chan)
+                sum += value.as_int
+            END
+        CATCH CHANNEL_ERROR:
+            RETURN CREATE_INT(sum)
+        END
+    END)
+    
+    # Run both coroutines
+    CORO_RESUME(vm, producer, NIL_VALUE)
+    result := CORO_RESUME(vm, consumer, NIL_VALUE)
+
+# Example: Async/await pattern
+EXAMPLE_ASYNC_AWAIT:
+    async_read := CORO_CREATE_GENERATOR(vm, FUNCTION():
+        fd := OPEN_FILE("data.txt")
+        WHILE NOT EOF(fd):
+            # Yield to event loop while waiting
+            CORO_YIELD(vm, CREATE_WAIT_EVENT(fd))
+            data := READ_CHUNK(fd)
+            CORO_YIELD(vm, data)
+        END
+    END)
+    
+    main_coro := CORO_CREATE(vm, FUNCTION():
+        data := CORO_AWAIT(vm, async_read)
+        PROCESS_DATA(data)
+    END)
+

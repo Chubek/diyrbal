@@ -1,0 +1,423 @@
+LANGUAGE = "sudolang"
+
+############################################################
+#  DIYRBAL SYMBOL TABLE                                   #
+#  Abstract datatype for lexical analysis through runtime #
+############################################################
+
+########################################
+# SECTION 0 — CONSTANTS & TYPES
+########################################
+
+# Symbol types
+CONST SYM_VARIABLE      = 0x01   # Local/global variable
+CONST SYM_FUNCTION      = 0x02   # Function name
+CONST SYM_CLASS         = 0x03   # Class name
+CONST SYM_METHOD        = 0x04   # Method name
+CONST SYM_MODULE        = 0x05   # Module name
+CONST SYM_CONSTANT      = 0x06   # Constant value
+CONST SYM_PARAMETER     = 0x07   # Function parameter
+CONST SYM_KEYWORD       = 0x08   # Language keyword
+CONST SYM_BUILTIN       = 0x09   # Built-in function
+CONST SYM_GENERATOR     = 0x0A   # Generator function
+CONST SYM_COROUTINE     = 0x0B   # Coroutine function
+CONST SYM_ANNOTATION    = 0x0C   # Type annotation
+
+# Symbol flags (can be OR'd)
+CONST SYMFLAG_LOCAL     = 0x0001  # Local scope
+CONST SYMFLAG_GLOBAL    = 0x0002  # Global scope
+CONST SYMFLAG_NONLOCAL  = 0x0004  # Nonlocal (free variable)
+CONST SYMFLAG_CELL      = 0x0008  # Cell variable (captured)
+CONST SYMFLAG_FREE      = 0x0010  # Free variable
+CONST SYMFLAG_IMPORTED  = 0x0020  # Imported from module
+CONST SYMFLAG_ASSIGNED  = 0x0040  # Has been assigned to
+CONST SYMFLAG_REFERENCED= 0x0080  # Has been referenced
+CONST SYMFLAG_PARAMETER = 0x0100  # Is a parameter
+CONST SYMFLAG_NESTED    = 0x0200  # Defined in nested scope
+CONST SYMFLAG_GENERATOR = 0x0400  # Is a generator
+CONST SYMFLAG_COROUTINE = 0x0800  # Is a coroutine
+CONST SYMFLAG_COMPREHENSION = 0x1000  # In comprehension
+CONST SYMFLAG_ANNOTATED = 0x2000  # Has type annotation
+CONST SYMFLAG_FINAL     = 0x4000  # Cannot be reassigned
+CONST SYMFLAG_CLASSMETHOD = 0x8000  # Class method
+
+# Scope types
+CONST SCOPE_MODULE      = 0    # Module/global scope
+CONST SCOPE_CLASS       = 1    # Class definition
+CONST SCOPE_FUNCTION    = 2    # Function/method body
+CONST SCOPE_COMPREHENSION = 3  # List/dict comprehension
+CONST SCOPE_LAMBDA      = 4    # Lambda expression
+CONST SCOPE_GENERATOR   = 5    # Generator expression
+CONST SCOPE_COROUTINE   = 6    # Coroutine scope
+
+# Symbol table limits
+CONST MAX_SCOPE_DEPTH   = 256  # Maximum nesting depth
+CONST INITIAL_TABLE_SIZE = 64  # Initial hash table capacity
+CONST MAX_SYMBOL_LENGTH = 255  # Maximum identifier length
+
+########################################
+# SECTION 1 — CORE STRUCTURES
+########################################
+
+STRUCT Symbol:
+    # Identity
+    name        : String*           # Symbol name (interned)
+    id          : u32               # Unique symbol ID
+    
+    # Classification
+    type        : u8                # Symbol type
+    flags       : u32               # Symbol flags
+    
+    # Scope information
+    scope_id    : u32               # ID of containing scope
+    scope_level : u16               # Nesting level (0 = global)
+    
+    # Location in source
+    first_lineno: u32               # First line where defined
+    first_col   : u32               # First column
+    last_lineno : u32               # Last line referenced
+    last_col    : u32               # Last column
+    
+    # Type information
+    type_info   : TypeInfo*         # Static type if known
+    annotation  : String*           # Type annotation string
+    
+    # Value/binding
+    value       : Value             # Compile-time constant value
+    offset      : i32               # Stack offset or global index
+    
+    # Usage tracking
+    def_count   : u32               # Number of definitions
+    use_count   : u32               # Number of uses
+    
+    # Linkage
+    module      : String*           # Module where defined
+    qualified   : String*           # Fully qualified name
+    
+    # Additional metadata
+    doc_string  : String*           # Documentation string
+    attributes  : Map<String*, Value>*  # Custom attributes
+END
+
+STRUCT SymbolTable:
+    # Core hash table (distance-based)
+    entries     : DIY_Entry*        # Hash table entries
+    occupied    : bool*             # Occupation bitmap
+    capacity    : size_t            # Current capacity
+    size        : size_t            # Number of entries
+    
+    # Table identity
+    table_id    : u32               # Unique table ID
+    scope_type  : u8                # Type of scope
+    scope_name  : String*           # Scope name
+    
+    # Scope chain
+    parent      : SymbolTable*      # Enclosing scope
+    children    : List<SymbolTable*>*  # Nested scopes
+    depth       : u16               # Nesting depth
+    
+    # Symbol lists (for ordered iteration)
+    symbols     : List<Symbol*>*    # All symbols in definition order
+    locals      : List<Symbol*>*    # Local variables
+    globals     : List<Symbol*>*    # Global variables
+    nonlocals   : List<Symbol*>*    # Nonlocal variables
+    frees       : List<Symbol*>*    # Free variables
+    cells       : List<Symbol*>*    # Cell variables
+    
+    # Special symbols
+    parameters  : List<Symbol*>*    # Function parameters
+    return_type : TypeInfo*         # Function return type
+    
+    # Compilation state
+    cur_offset  : i32               # Current stack offset
+    max_offset  : i32               # Maximum stack depth
+    
+    # Optimizations
+    const_cache : Map<String*, Value>*  # Constant folding cache
+    
+    # Statistics
+    stats       : SymTableStats     # Performance metrics
+END
+
+STRUCT SymTableStats:
+    lookups     : u64               # Total lookups
+    hits        : u64               # Lookup hits
+    misses      : u64               # Lookup misses
+    collisions  : u64               # Hash collisions
+    rehashes    : u64               # Table rehashes
+    max_chain   : u32               # Maximum probe chain
+END
+
+STRUCT TypeInfo:
+    # Type information for symbols
+    base_type   : u8                # Basic type
+    is_nullable : bool              # Can be null
+    is_const    : bool              # Immutable
+    
+    # Complex types
+    element_type: TypeInfo*         # For arrays/lists
+    key_type    : TypeInfo*         # For maps
+    value_type  : TypeInfo*         # For maps
+    param_types : List<TypeInfo*>*  # For functions
+    return_type : TypeInfo*         # For functions
+    
+    # Class types
+    class_name  : String*           # Class name
+    base_class  : TypeInfo*         # Base class type
+END
+
+########################################
+# SECTION 2 — CORE OPERATIONS
+########################################
+
+FUNCTION SYMTBL_CREATE(scope_type: u8, scope_name: String*, 
+                      parent: SymbolTable*) RETURNS SymbolTable*:
+    
+    table := ALLOCATE(SymbolTable)
+    
+    # Initialize distance-based hash table
+    table->capacity := INITIAL_TABLE_SIZE
+    table->entries := CALLOC(table->capacity, sizeof(DIY_Entry))
+    table->occupied := CALLOC(table->capacity, sizeof(bool))
+    table->size := 0
+    
+    # Set scope information
+    table->scope_type := scope_type
+    table->scope_name := STRING_INTERN(scope_name)
+    table->parent := parent
+    table->depth := parent ? parent->depth + 1 : 0
+    
+    # Validate depth
+    IF table->depth > MAX_SCOPE_DEPTH:
+        THROW_ERROR(RECURSION_ERROR, "maximum scope depth exceeded")
+    END
+    
+    # Initialize lists
+    table->symbols := LIST_CREATE()
+    table->locals := LIST_CREATE()
+    table->globals := LIST_CREATE()
+    table->nonlocals := LIST_CREATE()
+    table->frees := LIST_CREATE()
+    table->cells := LIST_CREATE()
+    table->parameters := LIST_CREATE()
+    table->children := LIST_CREATE()
+    
+    # Initialize optimization cache
+    table->const_cache := MAP_CREATE()
+    
+    # Link to parent
+    IF parent != nil:
+        LIST_APPEND(parent->children, table)
+    END
+    
+    # Generate unique ID
+    STATIC next_id := 0
+    table->table_id := ATOMIC_INCREMENT(&next_id)
+    
+    RETURN table
+END
+
+FUNCTION SYMTBL_INSTALL(table: SymbolTable*, name: String*, 
+                       type: u8, flags: u32) RETURNS Symbol*:
+    
+    # Check if symbol already exists
+    existing := SYMTBL_RETRIEVE_LOCAL(table, name)
+    IF existing != nil:
+        # Update existing symbol
+        existing->flags |= flags
+        existing->use_count++
+        RETURN existing
+    END
+    
+    # Create new symbol
+    symbol := ALLOCATE(Symbol)
+    symbol->name := STRING_INTERN(name)
+    symbol->type := type
+    symbol->flags := flags
+    symbol->scope_id := table->table_id
+    symbol->scope_level := table->depth
+    
+    # Generate unique ID
+    STATIC next_sym_id := 0
+    symbol->id := ATOMIC_INCREMENT(&next_sym_id)
+    
+    # Set scope-specific flags
+    IF table->scope_type == SCOPE_MODULE:
+        symbol->flags |= SYMFLAG_GLOBAL
+    ELIF table->scope_type == SCOPE_FUNCTION:
+        symbol->flags |= SYMFLAG_LOCAL
+    END
+    
+    # Check if name needs to grow the table
+    SYMTBL_MAYBE_GROW(table)
+    
+    # Insert using distance-based probing
+    hash := STRING_HASH(name)
+    idx := hash & (table->capacity - 1)
+    dist := 0
+    
+    entry := DIY_Entry{
+        .key := name AS DIY_Object*,
+        .value := symbol AS DIY_Object*
+    }
+    
+    WHILE true:
+        IF NOT table->occupied[idx]:
+            # Found empty slot
+            table->entries[idx] := entry
+            table->occupied[idx] := true
+            table->size++
+            BREAK
+        END
+        
+        # Check existing entry's distance
+        existing_entry := &table->entries[idx]
+        existing_hash := STRING_HASH(existing_entry->key AS String*)
+        existing_home := existing_hash & (table->capacity - 1)
+        existing_dist := (idx + table->capacity - existing_home) 
+                        & (table->capacity - 1)
+        
+        IF existing_dist < dist:
+            # Robin Hood: swap with existing entry
+            temp := table->entries[idx]
+            table->entries[idx] := entry
+            entry := temp
+            dist := existing_dist
+        END
+        
+        idx := (idx + 1) & (table->capacity - 1)
+        dist++
+    END
+    
+    # Add to appropriate lists
+    LIST_APPEND(table->symbols, symbol)
+    
+    IF flags & SYMFLAG_LOCAL:
+        LIST_APPEND(table->locals, symbol)
+    ELIF flags & SYMFLAG_GLOBAL:
+        LIST_APPEND(table->globals, symbol)
+    ELIF flags & SYMFLAG_NONLOCAL:
+        LIST_APPEND(table->nonlocals, symbol)
+    END
+    
+    IF flags & SYMFLAG_FREE:
+        LIST_APPEND(table->frees, symbol)
+    END
+    
+    IF flags & SYMFLAG_CELL:
+        LIST_APPEND(table->cells, symbol)
+    END
+    
+    IF flags & SYMFLAG_PARAMETER:
+        LIST_APPEND(table->parameters, symbol)
+        symbol->offset := table->parameters->size - 1
+    END
+    
+    # Update statistics
+    table->stats.lookups++
+    
+    RETURN symbol
+END
+
+FUNCTION SYMTBL_RETRIEVE(table: SymbolTable*, name: String*) 
+    RETURNS Symbol*:
+    
+    # Try current scope first
+    symbol := SYMTBL_RETRIEVE_LOCAL(table, name)
+    IF symbol != nil:
+        RETURN symbol
+    END
+    
+    # Search parent scopes
+    current := table->parent
+    WHILE current != nil:
+        symbol := SYMTBL_RETRIEVE_LOCAL(current, name)
+        IF symbol != nil:
+            # Mark as free variable in current scope
+            IF table->scope_type == SCOPE_FUNCTION:
+                SYMTBL_MARK_FREE(table, name, symbol)
+            END
+            RETURN symbol
+        END
+        current := current->parent
+    END
+    
+    RETURN nil
+END
+
+FUNCTION SYMTBL_RETRIEVE_LOCAL(table: SymbolTable*, name: String*) 
+    RETURNS Symbol*:
+    
+    table->stats.lookups++
+    
+    hash := STRING_HASH(name)
+    idx := hash & (table->capacity - 1)
+    dist := 0
+    
+    WHILE table->occupied[idx]:
+        entry := &table->entries[idx]
+        
+        IF STRING_EQUALS(entry->key AS String*, name):
+            table->stats.hits++
+            symbol := entry->value AS Symbol*
+            symbol->use_count++
+            RETURN symbol
+        END
+        
+        # Check if we've gone too far
+        existing_hash := STRING_HASH(entry->key AS String*)
+        existing_home := existing_hash & (table->capacity - 1)
+        existing_dist := (idx + table->capacity - existing_home) 
+                        & (table->capacity - 1)
+        
+        IF existing_dist < dist:
+            # Symbol not in table
+            table->stats.misses++
+            RETURN nil
+        END
+        
+        idx := (idx + 1) & (table->capacity - 1)
+        dist++
+        
+        IF dist > table->stats.max_chain:
+            table->stats.max_chain := dist
+        END
+    END
+    
+    table->stats.misses++
+    RETURN nil
+END
+
+FUNCTION SYMTBL_DELETE(table: SymbolTable*, name: String*) RETURNS bool:
+    
+    hash := STRING_HASH(name)
+    idx := hash & (table->capacity - 1)
+    dist := 0
+    
+    WHILE table->occupied[idx]:
+        entry := &table->entries[idx]
+        
+        IF STRING_EQUALS(entry->key AS String*, name):
+            # Found symbol to delete
+            symbol := entry->value AS Symbol*
+            
+            # Remove from lists
+            LIST_REMOVE(table->symbols, symbol)
+            IF symbol->flags & SYMFLAG_LOCAL:
+                LIST_REMOVE(table->locals, symbol)
+            END
+            IF symbol->flags & SYMFLAG_GLOBAL:
+                LIST_REMOVE(table->globals, symbol)
+            END
+            # ... remove from other lists
+            
+            # Shift subsequent entries back (Robin Hood deletion)
+            next_idx := (idx + 1) & (table->capacity - 1)
+            WHILE table->occupied[next_idx]:
+                next_entry := &table->entries[next_idx]
+                next_hash := STRING_HASH(next_entry->key AS String*)
+                next_home := next_hash & (table->capacity - 1)
+                probe_len := (next_idx + table->capacity - next_home) 
+                            & (table->capacity - 1)
+                
+                IF probe_

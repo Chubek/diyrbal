@@ -1,0 +1,478 @@
+LANGUAGE = "sudolang"
+
+############################################################
+#  DIYRBAL RUNTIME OBJECT REPRESENTATION                   #
+#  NaN-boxed tagged union with first-class metaclasses     #
+############################################################
+
+########################################
+# SECTION 0 — CONSTANTS & BIT LAYOUT
+########################################
+
+# IEEE 754 double precision NaN boxing layout:
+# Quiet NaN: 0x7FF8_0000_0000_0000 to 0x7FFF_FFFF_FFFF_FFFF
+# We use:    0xFFF8_xxxx_xxxx_xxxx for tagged values
+#           (sign bit set to distinguish from regular NaNs)
+
+CONST NAN_TAG_MASK    = 0xFFF8_0000_0000_0000
+CONST QNAN_MASK       = 0x7FF8_0000_0000_0000
+CONST SIGN_BIT        = 0x8000_0000_0000_0000
+
+# Type tags (upper 16 bits of NaN payload)
+CONST TAG_SHIFT       = 48
+CONST TAG_MASK        = 0x0007_0000_0000_0000
+CONST PAYLOAD_MASK    = 0x0000_FFFF_FFFF_FFFF
+
+# Primary type tags
+CONST TAG_NIL         = 0x0000
+CONST TAG_TRUE        = 0x0001
+CONST TAG_FALSE       = 0x0002
+CONST TAG_INT48       = 0x0003  # 48-bit immediate integer
+CONST TAG_CHAR        = 0x0004  # Unicode codepoint
+CONST TAG_SYMBOL      = 0x0005  # Interned symbol ID
+CONST TAG_PTR         = 0x0006  # Heap pointer (48-bit)
+CONST TAG_FLOAT       = 0x0007  # Boxed float (when self-tagging fails)
+
+# Heap object type tags (stored in object header)
+CONST HTYPE_STRING    = 0x00
+CONST HTYPE_BIGNUM    = 0x01
+CONST HTYPE_ARRAY     = 0x02
+CONST HTYPE_LIST      = 0x03
+CONST HTYPE_DICT      = 0x04
+CONST HTYPE_CLOSURE   = 0x05
+CONST HTYPE_CLASS     = 0x06
+CONST HTYPE_INSTANCE  = 0x07
+CONST HTYPE_METHOD    = 0x08
+CONST HTYPE_UPVALUE   = 0x09
+CONST HTYPE_WEAKREF   = 0x0A
+CONST HTYPE_FORWARD   = 0xFF    # GC forwarding pointer
+
+########################################
+# SECTION 1 — VALUE REPRESENTATION
+########################################
+
+TYPE Value = u64    # All values are 64-bit
+
+# === Value encoding/decoding ===
+
+FUNCTION MAKE_NANBOX(tag: u16, payload: u48) RETURNS Value:
+    RETURN NAN_TAG_MASK OR ((tag AS u64) << TAG_SHIFT) OR (payload AND PAYLOAD_MASK)
+END
+
+FUNCTION IS_FLOAT(v: Value) RETURNS bool:
+    # Floats are NOT NaN-boxed (including actual NaNs and infinities)
+    RETURN (v AND QNAN_MASK) != QNAN_MASK
+END
+
+FUNCTION IS_NANBOXED(v: Value) RETURNS bool:
+    RETURN (v AND NAN_TAG_MASK) == NAN_TAG_MASK
+END
+
+FUNCTION GET_TAG(v: Value) RETURNS u16:
+    ASSERT IS_NANBOXED(v)
+    RETURN (v >> TAG_SHIFT) AND 0x7
+END
+
+FUNCTION GET_PAYLOAD(v: Value) RETURNS u48:
+    RETURN v AND PAYLOAD_MASK
+END
+
+# === Immediate values ===
+
+CONST VAL_NIL   = MAKE_NANBOX(TAG_NIL, 0)
+CONST VAL_TRUE  = MAKE_NANBOX(TAG_TRUE, 1)
+CONST VAL_FALSE = MAKE_NANBOX(TAG_FALSE, 0)
+
+FUNCTION MAKE_INT48(i: i48) RETURNS Value:
+    # Sign-extend negative numbers
+    RETURN MAKE_NANBOX(TAG_INT48, i AS u48)
+END
+
+FUNCTION MAKE_CHAR(codepoint: u32) RETURNS Value:
+    ASSERT codepoint <= 0x10FFFF    # Valid Unicode
+    RETURN MAKE_NANBOX(TAG_CHAR, codepoint)
+END
+
+FUNCTION MAKE_SYMBOL(id: u32) RETURNS Value:
+    RETURN MAKE_NANBOX(TAG_SYMBOL, id)
+END
+
+FUNCTION MAKE_PTR(ptr: pointer) RETURNS Value:
+    # Assumes 48-bit address space
+    addr := (ptr AS u64) AND PAYLOAD_MASK
+    RETURN MAKE_NANBOX(TAG_PTR, addr)
+END
+
+FUNCTION GET_PTR(v: Value) RETURNS pointer:
+    ASSERT GET_TAG(v) == TAG_PTR
+    RETURN GET_PAYLOAD(v) AS pointer
+END
+
+########################################
+# SECTION 2 — HEAP OBJECT HEADER
+########################################
+
+# All heap objects share this header
+STRUCT ObjectHeader:
+    type_flags : u32    # 8-bit type + 24-bit flags/size
+    metaclass  : Value  # Every object has a metaclass
+    
+    # Type-specific data follows...
+END
+
+# Header access macros
+FUNCTION OBJ_TYPE(h: ObjectHeader*) RETURNS u8:
+    RETURN h->type_flags AND 0xFF
+END
+
+FUNCTION OBJ_SIZE_OR_FLAGS(h: ObjectHeader*) RETURNS u24:
+    RETURN h->type_flags >> 8
+END
+
+FUNCTION SET_OBJ_HEADER(h: ObjectHeader*, type: u8, size_or_flags: u24):
+    h->type_flags := (size_or_flags << 8) OR type
+END
+
+########################################
+# SECTION 3 — PRIMITIVE OBJECTS
+########################################
+
+# === Strings (immutable, UTF-8) ===
+STRUCT String:
+    header : ObjectHeader
+    hash   : u32
+    length : u32        # byte length
+    chars  : ARRAY[*] OF u8
+END
+
+# === Big Numbers (arbitrary precision) ===
+STRUCT BigNum:
+    header : ObjectHeader
+    sign   : bool
+    size   : u32        # number of limbs
+    limbs  : ARRAY[*] OF u64
+END
+
+# === Dynamic Arrays ===
+STRUCT DynArray:
+    header   : ObjectHeader
+    length   : u64      # current element count
+    capacity : u64      # allocated slots
+    elements : ARRAY[*] OF Value
+END
+
+# === Linked List Node ===
+STRUCT ListNode:
+    header : ObjectHeader
+    car    : Value      # head
+    cdr    : Value      # tail (next node or nil)
+END
+
+# === Hash Table (for dicts and objects) ===
+STRUCT HashTable:
+    header    : ObjectHeader  
+    count     : u64
+    capacity  : u64
+    entries   : ARRAY[*] OF HashEntry
+END
+
+STRUCT HashEntry:
+    key   : Value
+    value : Value
+    hash  : u64         # cached hash
+    next  : u32         # chain for collisions
+END
+
+########################################
+# SECTION 4 — CLOSURES & UPVALUES
+########################################
+
+# Based on Lua's closure implementation
+STRUCT Closure:
+    header     : ObjectHeader
+    proto      : Proto*           # shared function prototype
+    upval_count: u16
+    env        : Value            # lexical environment (usually a dict)
+    upvalues   : ARRAY[*] OF Upvalue*
+END
+
+STRUCT Proto:
+    header      : ObjectHeader
+    arity       : u16
+    varargs     : bool
+    max_stack   : u16
+    code_size   : u32
+    const_count : u32
+    upval_info  : ARRAY[*] OF UpvalInfo
+    constants   : ARRAY[*] OF Value
+    bytecode    : ARRAY[*] OF u8
+    debug_info  : DebugInfo*      # optional
+END
+
+STRUCT UpvalInfo:
+    in_stack : bool     # true if in parent's stack, false if in parent's upvalues
+    index    : u16      # stack slot or upvalue index
+    name     : Value    # symbol for debugging
+END
+
+STRUCT Upvalue:
+    header   : ObjectHeader
+    location : Value*   # points to stack or to 'value' field
+    value    : Value    # closed value (when location points here)
+    next     : Upvalue* # linked list for open upvalues
+END
+
+# === Method (bound function) ===
+STRUCT Method:
+    header   : ObjectHeader
+    receiver : Value    # 'self'
+    closure  : Value    # underlying closure
+END
+
+########################################
+# SECTION 5 — OBJECT SYSTEM (METACLASSES)
+########################################
+
+# Following the ObjVlisp model: classes are instances of metaclasses
+STRUCT Class:
+    header       : ObjectHeader   # metaclass field points to this class's metaclass
+    name         : Value          # symbol
+    superclass   : Value          # parent class or nil
+    
+    # Method dictionaries
+    methods      : Value          # HashTable of instance methods
+    class_methods: Value          # HashTable of class methods
+    
+    # Instance layout
+    instance_size: u32            # base size for instances
+    ivar_count   : u16            # instance variable count
+    ivar_names   : ARRAY[*] OF Value  # symbols
+    ivar_types   : ARRAY[*] OF Value  # optional type annotations
+    
+    # Class variables (stored as instance variables of the class)
+    cvars        : HashTable
+END
+
+STRUCT Instance:
+    header : ObjectHeader         # metaclass field points to instance's class
+    slots  : ARRAY[*] OF Value    # instance variables
+END
+
+# === The Metaclass Hierarchy ===
+# Following ObjVlisp: Metaclass is its own metaclass
+# Class is an instance of Metaclass
+# Object is an instance of Class and root of inheritance
+
+GLOBAL Class*     g_metaclass_class  # Metaclass
+GLOBAL Class*     g_class_class      # Class  
+GLOBAL Class*     g_object_class     # Object
+
+FUNCTION INIT_METACLASS_HIERARCHY():
+    # Bootstrap: create Metaclass first
+    g_metaclass_class := BOOTSTRAP_ALLOC(Class)
+    g_metaclass_class->header.type_flags := HTYPE_CLASS
+    g_metaclass_class->header.metaclass := MAKE_PTR(g_metaclass_class)  # Metaclass is its own metaclass
+    g_metaclass_class->name := MAKE_SYMBOL(INTERN("Metaclass"))
+    
+    # Create Class as instance of Metaclass
+    g_class_class := CREATE_CLASS("Class", g_metaclass_class, nil)
+    
+    # Create Object as instance of Class
+    g_object_class := CREATE_CLASS("Object", g_class_class, nil)
+    
+    # Fix up inheritance: Metaclass inherits from Class
+    g_metaclass_class->superclass := MAKE_PTR(g_class_class)
+    
+    # Class inherits from Object
+    g_class_class->superclass := MAKE_PTR(g_object_class)
+END
+
+########################################
+# SECTION 6 — TYPE CHECKING & DISPATCH
+########################################
+
+FUNCTION VALUE_TYPE(v: Value) RETURNS string:
+    IF IS_FLOAT(v):
+        RETURN "float"
+    END
+    
+    tag := GET_TAG(v)
+    CASE tag OF:
+        TAG_NIL:    RETURN "nil"
+        TAG_TRUE:   RETURN "true"
+        TAG_FALSE:  RETURN "false"
+        TAG_INT48:  RETURN "integer"
+        TAG_CHAR:   RETURN "character"
+        TAG_SYMBOL: RETURN "symbol"
+        TAG_PTR:
+            obj := GET_PTR(v) AS ObjectHeader*
+            htype := OBJ_TYPE(obj)
+            CASE htype OF:
+                HTYPE_STRING:   RETURN "string"
+                HTYPE_BIGNUM:   RETURN "bignum"
+                HTYPE_ARRAY:    RETURN "array"
+                HTYPE_LIST:     RETURN "list"
+                HTYPE_DICT:     RETURN "dict"
+                HTYPE_CLOSURE:  RETURN "closure"
+                HTYPE_CLASS:    RETURN "class"
+                HTYPE_INSTANCE: RETURN "instance"
+                HTYPE_METHOD:   RETURN "method"
+                DEFAULT:        RETURN "unknown"
+            END
+    END
+END
+
+FUNCTION GET_CLASS(v: Value) RETURNS Class*:
+    IF IS_FLOAT(v):
+        RETURN g_float_class
+    END
+    
+    tag := GET_TAG(v)
+    CASE tag OF:
+        TAG_NIL:    RETURN g_nil_class
+        TAG_TRUE,
+        TAG_FALSE:  RETURN g_bool_class
+        TAG_INT48:  RETURN g_int_class
+        TAG_CHAR:   RETURN g_char_class
+        TAG_SYMBOL: RETURN g_symbol_class
+        TAG_PTR:
+            obj := GET_PTR(v) AS ObjectHeader*
+            IF OBJ_TYPE(obj) == HTYPE_INSTANCE:
+                # Instance's metaclass is its class
+                RETURN GET_PTR(obj->metaclass) AS Class*
+            ELSE:
+                # Other objects have primitive type classes
+                RETURN GET_PRIMITIVE_CLASS(OBJ_TYPE(obj))
+            END
+    END
+END
+
+########################################
+# SECTION 7 — MEMORY MANAGEMENT HOOKS
+########################################
+
+FUNCTION IS_HEAP_PTR(v: Value) RETURNS bool:
+    RETURN IS_NANBOXED(v) AND GET_TAG(v) == TAG_PTR
+END
+
+FUNCTION MARK_VALUE(v: Value):
+    IF IS_HEAP_PTR(v):
+        obj := GET_PTR(v) AS ObjectHeader*
+        MARK_OBJECT(obj)
+    END
+END
+
+FUNCTION MARK_OBJECT(obj: ObjectHeader*):
+    IF obj == nil OR IS_MARKED(obj):
+        RETURN
+    END
+    
+    SET_MARK_BIT(obj)
+    
+    # Mark metaclass
+    MARK_VALUE(obj->metaclass)
+    
+    # Type-specific marking
+    CASE OBJ_TYPE(obj) OF:
+        HTYPE_CLOSURE:
+            c := obj AS Closure*
+            MARK_OBJECT(c->proto AS ObjectHeader*)
+            MARK_VALUE(c->env)
+            FOR i := 0 TO c->upval_count - 1:
+                MARK_OBJECT(c->upvalues[i] AS ObjectHeader*)
+            END
+            
+        HTYPE_CLASS:
+            cls := obj AS Class*
+            MARK_VALUE(cls->name)
+            MARK_VALUE(cls->superclass)
+            MARK_VALUE(cls->methods)
+            MARK_VALUE(cls->class_methods)
+            FOR i := 0 TO cls->ivar_count - 1:
+                MARK_VALUE(cls->ivar_names[i])
+                MARK_VALUE(cls->ivar_types[i])
+            END
+            # Mark class variables
+            MARK_OBJECT(&cls->cvars AS ObjectHeader*)
+            
+        # ... other types ...
+    END
+END
+
+########################################
+# SECTION 8 — SELF-TAGGING FLOATS
+########################################
+
+# Inspired by float self-tagging paper:
+# Transform floats to potentially self-tag common values
+
+FUNCTION TRY_SELF_TAG_FLOAT(f: f64) RETURNS Value:
+    bits := f AS u64
+    
+    # Check if already looks like our NaN-box pattern
+    IF (bits AND NAN_TAG_MASK) == NAN_TAG_MASK:
+        # Need to box this float
+        boxed := ALLOC(Float)
+        boxed->header.type_flags := HTYPE_FLOAT
+        boxed->value := f
+        RETURN MAKE_PTR(boxed)
+    ELSE:
+        # Can use directly
+        RETURN bits
+    END
+END
+
+FUNCTION FLOAT_VALUE(v: Value) RETURNS f64:
+    IF IS_FLOAT(v):
+        RETURN v AS f64
+    ELIF GET_TAG(v) == TAG_PTR:
+        obj := GET_PTR(v) AS ObjectHeader*
+        IF OBJ_TYPE(obj) == HTYPE_FLOAT:
+            RETURN (obj AS Float*)->value
+        END
+    END
+    ERROR("Not a float")
+END
+
+########################################
+# SECTION 9 — EXAMPLE USAGE
+########################################
+
+FUNCTION CREATE_CLOSURE_EXAMPLE():
+    # Create a closure that captures a variable
+    proto := ALLOC(Proto)
+    proto->header.type_flags := HTYPE_PROTO
+    proto->arity := 1
+    proto->upval_count := 1
+    
+    closure := ALLOC(Closure)
+    closure->header.type_flags := HTYPE_CLOSURE
+    closure->header.metaclass := MAKE_PTR(g_closure_class)
+    closure->proto := proto
+    closure->upval_count := 1
+    
+    # Create upvalue pointing to captured variable
+    upval := ALLOC(Upvalue)
+    upval->header.type_flags := HTYPE_UPVALUE
+    upval->location := &captured_var
+    closure->upvalues[0] := upval
+    
+    RETURN MAKE_PTR(closure)
+END
+
+FUNCTION CREATE_CUSTOM_METACLASS_EXAMPLE():
+    # Create a metaclass that customizes instance creation
+    my_metaclass := CREATE_CLASS("MyMetaclass", g_metaclass_class, g_class_class)
+    
+    # Add custom 'new' method to metaclass
+    new_method := CREATE_METHOD(custom_new_impl)
+    SET_METHOD(my_metaclass, INTERN("new"), new_method)
+    
+    # Create a class using this metaclass
+    my_class := ALLOC(Instance)  # Classes are instances of their metaclass
+    my_class->header.metaclass := MAKE_PTR(my_metaclass)
+    INIT_INSTANCE(my_class, my_metaclass)
+    
+    RETURN MAKE_PTR(my_class)
+END
+

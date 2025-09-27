@@ -1,0 +1,764 @@
+LANGUAGE = "sudolang"
+
+############################################################
+#  DIYRBAL BYTECODE COMPILER                              #
+#  CFG to ISSA-based bytecode emission                    #
+############################################################
+
+########################################
+# SECTION 0 — CONSTANTS & OPCODES
+########################################
+
+# ISSA VM Opcodes (SSA-based)
+CONST OP_NOP            = 0x00   # No operation
+CONST OP_PHI            = 0x01   # SSA φ-function
+CONST OP_MOVE           = 0x02   # Move between SSA values
+
+# Constants and literals
+CONST OP_CONST_NIL      = 0x10   # Load nil
+CONST OP_CONST_TRUE     = 0x11   # Load true
+CONST OP_CONST_FALSE    = 0x12   # Load false
+CONST OP_CONST_INT      = 0x13   # Load integer constant
+CONST OP_CONST_FLOAT    = 0x14   # Load float constant
+CONST OP_CONST_STRING   = 0x15   # Load string constant
+
+# Arithmetic (SSA: dst := src1 op src2)
+CONST OP_ADD            = 0x20   # Addition
+CONST OP_SUB            = 0x21   # Subtraction
+CONST OP_MUL            = 0x22   # Multiplication
+CONST OP_DIV            = 0x23   # Division
+CONST OP_MOD            = 0x24   # Modulo
+CONST OP_POW            = 0x25   # Power
+CONST OP_NEG            = 0x26   # Negation (unary)
+
+# Comparison (SSA: dst := src1 cmp src2)
+CONST OP_EQ             = 0x30   # Equal
+CONST OP_NE             = 0x31   # Not equal
+CONST OP_LT             = 0x32   # Less than
+CONST OP_LE             = 0x33   # Less or equal
+CONST OP_GT             = 0x34   # Greater than
+CONST OP_GE             = 0x35   # Greater or equal
+
+# Logical (SSA form)
+CONST OP_AND            = 0x40   # Logical AND
+CONST OP_OR             = 0x41   # Logical OR
+CONST OP_NOT            = 0x42   # Logical NOT
+
+# Control flow
+CONST OP_JMP            = 0x50   # Unconditional jump
+CONST OP_JMP_IF         = 0x51   # Conditional jump
+CONST OP_JMP_IFNOT      = 0x52   # Jump if not
+CONST OP_RET            = 0x53   # Return from function
+CONST OP_YIELD          = 0x54   # Yield (generator)
+CONST OP_AWAIT          = 0x55   # Await (coroutine)
+
+# Function calls (SSA form)
+CONST OP_CALL           = 0x60   # Function call
+CONST OP_CALL_METHOD    = 0x61   # Method call
+CONST OP_CALL_TAIL      = 0x62   # Tail call
+
+# Object operations (SSA form)
+CONST OP_NEW_OBJECT     = 0x70   # Create object
+CONST OP_NEW_ARRAY      = 0x71   # Create array
+CONST OP_NEW_DICT       = 0x72   # Create dictionary
+CONST OP_GET_FIELD      = 0x73   # Get object field
+CONST OP_SET_FIELD      = 0x74   # Set object field (returns new object in SSA)
+CONST OP_GET_ELEM       = 0x75   # Get array/dict element
+CONST OP_SET_ELEM       = 0x76   # Set array/dict element (returns new array)
+
+# Array SSA operations (based on Cytron model)
+CONST OP_ARRAY_PHI      = 0x80   # Array φ-function
+CONST OP_ARRAY_UPDATE   = 0x81   # SSA array update
+CONST OP_ARRAY_ACCESS   = 0x82   # SSA array access
+
+# Exception handling
+CONST OP_TRY_ENTER      = 0x90   # Enter try block
+CONST OP_TRY_EXIT       = 0x91   # Exit try block
+CONST OP_THROW          = 0x92   # Throw exception
+CONST OP_CATCH          = 0x93   # Catch exception
+
+# Closures and upvalues
+CONST OP_CLOSURE        = 0xA0   # Create closure
+CONST OP_GET_UPVAL      = 0xA1   # Get upvalue
+CONST OP_SET_UPVAL      = 0xA2   # Set upvalue (SSA: returns new closure)
+CONST OP_CLOSE_UPVAL    = 0xA3   # Close upvalue
+
+# Module operations
+CONST OP_IMPORT         = 0xB0   # Import module
+CONST OP_GET_GLOBAL     = 0xB1   # Get global
+CONST OP_SET_GLOBAL     = 0xB2   # Set global
+
+# Debug/metadata
+CONST OP_DEBUG_LINE     = 0xF0   # Debug line info
+CONST OP_DEBUG_VAR      = 0xF1   # Debug variable info
+
+########################################
+# SECTION 1 — CORE STRUCTURES
+########################################
+
+STRUCT SSAValue:
+    id          : u32               # Unique SSA value ID
+    type        : TypeInfo*         # Type of this value
+    def_block   : u32               # Block where defined
+    def_insn    : u32               # Instruction that defines it
+    users       : List<SSAUse*>*    # List of uses
+    version     : u32               # Version number for debugging
+END
+
+STRUCT SSAUse:
+    value       : SSAValue*         # The value being used
+    block       : u32               # Block where used
+    insn        : u32               # Instruction using it
+    operand_idx : u8                # Which operand (0, 1, 2, ...)
+END
+
+STRUCT Instruction:
+    opcode      : u8                # Operation code
+    ssa_def     : SSAValue*         # SSA value defined (if any)
+    operands    : List<SSAValue*>*  # SSA operands
+    
+    # Additional data based on opcode
+    const_idx   : u32               # For constant ops
+    target      : u32               # For jumps
+    num_args    : u16               # For calls
+    
+    # Debug information
+    line        : u32               # Source line
+    column      : u32               # Source column
+END
+
+STRUCT PhiNode:
+    result      : SSAValue*         # SSA value produced
+    operands    : List<PhiOperand*>* # Incoming values
+END
+
+STRUCT PhiOperand:
+    value       : SSAValue*         # Incoming SSA value
+    block       : BasicBlock*       # Predecessor block
+END
+
+STRUCT CompiledBlock:
+    id          : u32               # Block ID
+    instructions: List<Instruction*>* # Instructions
+    phi_nodes   : List<PhiNode*>*   # Phi nodes at start
+    
+    # For optimization
+    live_in     : Set<SSAValue*>*   # Live values at entry
+    live_out    : Set<SSAValue*>*   # Live values at exit
+END
+
+STRUCT CompiledFunction:
+    name        : String*           # Function name
+    params      : List<SSAValue*>*  # Parameter SSA values
+    blocks      : Map<u32, CompiledBlock*>* # Blocks by ID
+    constants   : List<DIY_Object*>* # Constant pool
+    
+    # SSA management
+    next_ssa_id : u32               # Next SSA value ID
+    ssa_values  : Map<u32, SSAValue*>* # All SSA values
+    
+    # Metadata
+    max_locals  : u32               # For interpreter
+    upvalues    : List<UpvalueInfo*>* # Captured variables
+    line_info   : List<LineInfo*>*  # Debug line mapping
+END
+
+STRUCT CompilerState:
+    current_fn  : CompiledFunction* # Current function
+    current_block: CompiledBlock*   # Current block
+    
+    # SSA construction
+    value_stack : Stack<SSAValue*>* # Evaluation stack
+    var_versions: Map<Symbol*, SSAValue*>* # Current variable versions
+    
+    # Phi node construction
+    incomplete_phis: Map<BasicBlock*, List<PhiNode*>*>*
+    sealed_blocks: Set<BasicBlock*>*
+    
+    # Global state
+    symtable    : SymbolTable*      # Symbol table
+    constants   : ConstantPool*     # Global constants
+    
+    # Optimization passes
+    opt_level   : u8                # Optimization level
+    trace_mode  : bool              # Trace-based compilation
+END
+
+########################################
+# SECTION 2 — SSA VALUE MANAGEMENT
+########################################
+
+FUNCTION NEW_SSA_VALUE(compiler: CompilerState*, type: TypeInfo*) 
+    RETURNS SSAValue*:
+    
+    value := ALLOCATE(SSAValue)
+    value->id := compiler->current_fn->next_ssa_id++
+    value->type := type
+    value->def_block := compiler->current_block->id
+    value->users := LIST_CREATE()
+    
+    # Register in function
+    MAP_SET(compiler->current_fn->ssa_values, value->id, value)
+    
+    RETURN value
+END
+
+FUNCTION USE_SSA_VALUE(value: SSAValue*, block: u32, insn: u32, 
+                      operand_idx: u8):
+    use := ALLOCATE(SSAUse)
+    use->value := value
+    use->block := block
+    use->insn := insn
+    use->operand_idx := operand_idx
+    
+    LIST_APPEND(value->users, use)
+END
+
+########################################
+# SECTION 3 — INSTRUCTION EMISSION
+########################################
+
+FUNCTION EMIT_INSTRUCTION(compiler: CompilerState*, opcode: u8, 
+                         result_type: TypeInfo*) RETURNS Instruction*:
+    
+    insn := ALLOCATE(Instruction)
+    insn->opcode := opcode
+    insn->operands := LIST_CREATE()
+    
+    # Create SSA def if instruction produces a value
+    IF PRODUCES_VALUE(opcode):
+        insn->ssa_def := NEW_SSA_VALUE(compiler, result_type)
+        insn->ssa_def->def_insn := 
+            compiler->current_block->instructions->size
+    END
+    
+    LIST_APPEND(compiler->current_block->instructions, insn)
+    
+    RETURN insn
+END
+
+FUNCTION EMIT_CONST_INT(compiler: CompilerState*, value: i64) 
+    RETURNS SSAValue*:
+    
+    insn := EMIT_INSTRUCTION(compiler, OP_CONST_INT, TYPE_INT)
+    
+    # Add to constant pool
+    const_obj := INT_TO_OBJECT(value)
+    insn->const_idx := ADD_CONSTANT(compiler->current_fn, const_obj)
+    
+    RETURN insn->ssa_def
+END
+
+FUNCTION EMIT_BINARY_OP(compiler: CompilerState*, opcode: u8,
+                       left: SSAValue*, right: SSAValue*) 
+    RETURNS SSAValue*:
+    
+    # Determine result type
+    result_type := INFER_BINARY_TYPE(opcode, left->type, right->type)
+    
+    insn := EMIT_INSTRUCTION(compiler, opcode, result_type)
+    LIST_APPEND(insn->operands, left)
+    LIST_APPEND(insn->operands, right)
+    
+    # Record uses
+    USE_SSA_VALUE(left, compiler->current_block->id, 
+                  insn->ssa_def->def_insn, 0)
+    USE_SSA_VALUE(right, compiler->current_block->id,
+                  insn->ssa_def->def_insn, 1)
+    
+    RETURN insn->ssa_def
+END
+
+########################################
+# SECTION 4 — PHI NODE CONSTRUCTION
+########################################
+
+FUNCTION EMIT_PHI(compiler: CompilerState*, type: TypeInfo*) 
+    RETURNS PhiNode*:
+    
+    phi := ALLOCATE(PhiNode)
+    phi->result := NEW_SSA_VALUE(compiler, type)
+    phi->operands := LIST_CREATE()
+    
+    LIST_APPEND(compiler->current_block->phi_nodes, phi)
+    
+    RETURN phi
+END
+
+FUNCTION ADD_PHI_OPERAND(phi: PhiNode*, value: SSAValue*, 
+                        pred_block: BasicBlock*):
+    
+    operand := ALLOCATE(PhiOperand)
+    operand->value := value
+    operand->block := pred_block
+    
+    LIST_APPEND(phi->operands, operand)
+    USE_SSA_VALUE(value, pred_block->id, 0, phi->operands->size - 1)
+END
+
+FUNCTION READ_VARIABLE(compiler: CompilerState*, var: Symbol*, 
+                      block: BasicBlock*) RETURNS SSAValue*:
+    
+    # Check if we have a local definition
+    local_val := MAP_GET(compiler->var_versions, var)
+    IF local_val != nil:
+        RETURN local_val
+    END
+    
+    # Need to check predecessors
+    RETURN READ_VARIABLE_RECURSIVE(compiler, var, block)
+END
+
+FUNCTION READ_VARIABLE_RECURSIVE(compiler: CompilerState*, 
+                                var: Symbol*, block: BasicBlock*) 
+    RETURNS SSAValue*:
+    
+    IF NOT IS_SEALED(compiler, block):
+        # Block not sealed yet, create incomplete phi
+        phi := EMIT_PHI(compiler, var->type_info)
+        MAP_SET(compiler->incomplete_phis, block, phi)
+        RETURN phi->result
+    ELIF block->predecessors->size == 1:
+        # Single predecessor, no phi needed
+        RETURN READ_VARIABLE(compiler, var, block->predecessors[0])
+    ELSE:
+        # Multiple predecessors, need phi
+        phi := EMIT_PHI(compiler, var->type_info)
+        WRITE_VARIABLE(compiler, var, block, phi->result)
+        
+        # Add phi operands from all predecessors
+        FOR pred IN block->predecessors:
+            value := READ_VARIABLE(compiler, var, pred)
+            ADD_PHI_OPERAND(phi, value, pred)
+        END
+        
+        RETURN phi->result
+    END
+END
+
+FUNCTION WRITE_VARIABLE(compiler: CompilerState*, var: Symbol*,
+                       block: BasicBlock*, value: SSAValue*):
+    MAP_SET(compiler->var_versions, var, value)
+END
+
+########################################
+# SECTION 5 — CFG TO BYTECODE
+########################################
+
+FUNCTION COMPILE_CFG(cfg: CFG*, symtable: SymbolTable*, 
+                    opt_level: u8) RETURNS CompiledFunction*:
+    
+    compiler := CREATE_COMPILER_STATE(symtable, opt_level)
+    func := CREATE_COMPILED_FUNCTION(cfg->name)
+    compiler->current_fn := func
+    
+    # Create SSA values for parameters
+    FOR param IN cfg->parameters:
+        param_ssa := NEW_SSA_VALUE(compiler, param->type_info)
+        LIST_APPEND(func->params, param_ssa)
+        WRITE_VARIABLE(compiler, param, cfg->entry_block, param_ssa)
+    END
+    
+    # Compile each block in topological order
+    sorted_blocks := TOPOLOGICAL_SORT(cfg)
+    FOR block IN sorted_blocks:
+        COMPILE_BLOCK(compiler, block)
+    END
+    
+    # Seal all blocks and complete phi nodes
+    FOR block IN sorted_blocks:
+        SEAL_BLOCK(compiler, block)
+    END
+    
+    # Run optimization passes
+    IF opt_level > 0:
+        OPTIMIZE_FUNCTION(compiler, func, opt_level)
+    END
+    
+    RETURN func
+END
+
+FUNCTION COMPILE_BLOCK(compiler: CompilerState*, block: BasicBlock*):
+    
+    compiled := ALLOCATE(CompiledBlock)
+    compiled->id := block->id
+    compiled->instructions := LIST_CREATE()
+    compiled->phi_nodes := LIST_CREATE()
+    
+    compiler->current_block := compiled
+    MAP_SET(compiler->current_fn->blocks, block->id, compiled)
+    
+    # Handle phi nodes from CFG
+    FOR phi IN block->phi_nodes:
+        ssa_phi := EMIT_PHI(compiler, phi->type)
+        # Phi operands will be filled when blocks are sealed
+    END
+    
+    # Compile each statement
+    FOR stmt IN block->statements:
+        COMPILE_STATEMENT(compiler, stmt)
+    END
+    
+    # Compile terminator
+    COMPILE_TERMINATOR(compiler, block->terminator)
+END
+
+FUNCTION COMPILE_STATEMENT(compiler: CompilerState*, stmt: Statement*):
+    
+    MATCH stmt->type:
+        CASE STMT_ASSIGN:
+            value := COMPILE_EXPRESSION(compiler, stmt->value)
+            WRITE_VARIABLE(compiler, stmt->target, 
+                         compiler->current_block, value)
+            
+        CASE STMT_EXPR:
+            COMPILE_EXPRESSION(compiler, stmt->expr)
+            
+        CASE STMT_RETURN:
+            IF stmt->value != nil:
+                value := COMPILE_EXPRESSION(compiler, stmt->value)
+                insn := EMIT_INSTRUCTION(compiler, OP_RET, nil)
+                LIST_APPEND(insn->operands, value)
+            ELSE:
+                EMIT_INSTRUCTION(compiler, OP_RET, nil)
+            END
+            
+        CASE STMT_YIELD:
+            value := COMPILE_EXPRESSION(compiler, stmt->value)
+            insn := EMIT_INSTRUCTION(compiler, OP_YIELD, stmt->value->type)
+            LIST_APPEND(insn->operands, value)
+            
+        CASE STMT_AWAIT:
+            value := COMPILE_EXPRESSION(compiler, stmt->value)
+            insn := EMIT_INSTRUCTION(compiler, OP_AWAIT, stmt->value->type)
+            LIST_APPEND(insn->operands, value)
+    END
+END
+
+FUNCTION COMPILE_EXPRESSION(compiler: CompilerState*, expr: Expression*) 
+    RETURNS SSAValue*:
+    
+    MATCH expr->type:
+        CASE EXPR_CONST:
+            MATCH expr->const_type:
+                CASE CONST_INT:
+                    RETURN EMIT_CONST_INT(compiler, expr->int_value)
+                CASE CONST_FLOAT:
+                    RETURN EMIT_CONST_FLOAT(compiler, expr->float_value)
+                CASE CONST_STRING:
+                    RETURN EMIT_CONST_STRING(compiler, expr->string_value)
+                CASE CONST_TRUE:
+                    RETURN EMIT_SIMPLE(compiler, OP_CONST_TRUE)
+                CASE CONST_FALSE:
+                    RETURN EMIT_SIMPLE(compiler, OP_CONST_FALSE)
+                CASE CONST_NIL:
+                    RETURN EMIT_SIMPLE(compiler, OP_CONST_NIL)
+            END
+            
+        CASE EXPR_VAR:
+            symbol := SYMTBL_RETRIEVE(compiler->symtable, expr->name)
+            RETURN READ_VARIABLE(compiler, symbol, 
+                               compiler->current_block)
+            
+        CASE EXPR_BINARY:
+            left := COMPILE_EXPRESSION(compiler, expr->left)
+            right := COMPILE_EXPRESSION(compiler, expr->right)
+            
+            opcode := BINARY_OP_TO_OPCODE(expr->op)
+            RETURN EMIT_BINARY_OP(compiler, opcode, left, right)
+            
+        CASE EXPR_UNARY:
+            operand := COMPILE_EXPRESSION(compiler, expr->operand)
+            opcode := UNARY_OP_TO_OPCODE(expr->op)
+            RETURN EMIT_UNARY_OP(compiler, opcode, operand)
+            
+        CASE EXPR_CALL:
+            # Compile function and arguments
+            func := COMPILE_EXPRESSION(compiler, expr->func)
+            
+            args := LIST_CREATE()
+            FOR arg IN expr->args:
+                arg_val := COMPILE_EXPRESSION(compiler, arg)
+                LIST_APPEND(args, arg_val)
+            END
+            
+            RETURN EMIT_CALL(compiler, func, args)
+            
+        CASE EXPR_ARRAY_ACCESS:
+            array := COMPILE_EXPRESSION(compiler, expr->array)
+            index := COMPILE_EXPRESSION(compiler, expr->index)
+            
+            # Use SSA array access
+            insn := EMIT_INSTRUCTION(compiler, OP_ARRAY_ACCESS, 
+                                   expr->element_type)
+            LIST_APPEND(insn->operands, array)
+            LIST_APPEND(insn->operands, index)
+            
+            RETURN insn->ssa_def
+            
+        CASE EXPR_ARRAY_UPDATE:
+            array := COMPILE_EXPRESSION(compiler, expr->array)
+            index := COMPILE_EXPRESSION(compiler, expr->index)
+            value := COMPILE_EXPRESSION(compiler, expr->value)
+            
+            # SSA array update returns new array
+            insn := EMIT_INSTRUCTION(compiler, OP_ARRAY_UPDATE,
+                                   array->type)
+            LIST_APPEND(insn->operands, array)
+            LIST_APPEND(insn->operands, index)
+            LIST_APPEND(insn->operands, value)
+            
+            RETURN insn->ssa_def
+    END
+END
+
+FUNCTION COMPILE_TERMINATOR(compiler: CompilerState*, term: Terminator*):
+    
+    MATCH term->type:
+        CASE TERM_RETURN:
+            IF term->value != nil:
+                value := COMPILE_EXPRESSION(compiler, term->value)
+                insn := EMIT_INSTRUCTION(compiler, OP_RET, nil)
+                LIST_APPEND(insn->operands, value)
+            ELSE:
+                EMIT_INSTRUCTION(compiler, OP_RET, nil)
+            END
+            
+        CASE TERM_BRANCH:
+            cond := COMPILE_EXPRESSION(compiler, term->condition)
+            
+            insn := EMIT_INSTRUCTION(compiler, OP_JMP_IF, nil)
+            LIST_APPEND(insn->operands, cond)
+            insn->target := term->true_block->id
+            
+            # Emit jump to false block
+            false_insn := EMIT_INSTRUCTION(compiler, OP_JMP, nil)
+            false_insn->target := term->false_block->id
+            
+        CASE TERM_JUMP:
+            insn := EMIT_INSTRUCTION(compiler, OP_JMP, nil)
+            insn->target := term->target->id
+            
+        CASE TERM_SWITCH:
+            value := COMPILE_EXPRESSION(compiler, term->value)
+            # Generate jump table or if-else chain
+            COMPILE_SWITCH(compiler, value, term->cases, 
+                          term->default_block)
+    END
+END
+
+########################################
+# SECTION 6 — OPTIMIZATION PASSES
+########################################
+
+FUNCTION OPTIMIZE_FUNCTION(compiler: CompilerState*, 
+                          func: CompiledFunction*, level: u8):
+    
+    # Level 1: Basic optimizations
+    IF level >= 1:
+        DEAD_CODE_ELIMINATION(func)
+        CONSTANT_FOLDING(compiler, func)
+        COMMON_SUBEXPR_ELIMINATION(func)
+    END
+    
+    # Level 2: SSA optimizations
+    IF level >= 2:
+        SPARSE_CONDITIONAL_CONST_PROP(func)
+        GLOBAL_VALUE_NUMBERING(func)
+        PARTIAL_REDUNDANCY_ELIMINATION(func)
+    END
+    
+    # Level 3: Advanced optimizations
+    IF level >= 3:
+        LOOP_INVARIANT_CODE_MOTION(func)
+        INDUCTION_VARIABLE_OPTIMIZATION(func)
+        IF compiler->trace_mode:
+            TRACE_OPTIMIZATION(compiler, func)
+        END
+    END
+    
+    # Always run these
+    PHI_ELIMINATION(func)
+    REGISTER_ALLOCATION(func)
+END
+
+FUNCTION CONSTANT_FOLDING(compiler: CompilerState*, 
+                         func: CompiledFunction*):
+    
+    FOR block IN func->blocks->values:
+        FOR insn IN block->instructions:
+            IF IS_BINARY_OP(insn->opcode):
+                left := insn->operands[0]
+                right := insn->operands[1]
+                
+                IF IS_CONSTANT(left) AND IS_CONSTANT(right):
+                    # Compute result at compile time
+                    result := EVAL_BINARY_OP(insn->opcode,
+                                           GET_CONST_VALUE(left),
+                                           GET_CONST_VALUE(right))
+                    
+                    # Replace with constant
+                    const_insn := CREATE_CONST_INSN(result)
+                    REPLACE_INSTRUCTION(insn, const_insn)
+                END
+            END
+        END
+    END
+END
+
+########################################
+# SECTION 7 — BYTECODE SERIALIZATION
+########################################
+
+STRUCT BytecodeChunk:
+    code        : u8*               # Bytecode array
+    size        : u32               # Size in bytes
+    capacity    : u32               # Allocated capacity
+    
+    constants   : DIY_Object**      # Constant pool
+    const_count : u32               # Number of constants
+    
+    # Debug information
+    lines       : u32*              # Line info parallel to code
+    locals      : LocalInfo*        # Local variable info
+    
+    # SSA metadata
+    ssa_map     : Map<u32, u32>*    # SSA ID to bytecode offset
+END
+
+FUNCTION SERIALIZE_FUNCTION(func: CompiledFunction*) 
+    RETURNS BytecodeChunk*:
+    
+    chunk := ALLOCATE(BytecodeChunk)
+    chunk->code := MALLOC(1024)  # Initial capacity
+    chunk->capacity := 1024
+    chunk->size := 0
+    
+    # Copy constant pool
+    chunk->const_count := func->constants->size
+    chunk->constants := MALLOC(chunk->const_count * sizeof(DIY_Object*))
+    MEMCPY(chunk->constants, func->constants->data, 
+           chunk->const_count * sizeof(DIY_Object*))
+    
+    # Serialize blocks in order
+    FOR block_id IN SORTED(func->blocks->keys):
+        block := func->blocks[block_id]
+        
+        # Record block start offset
+        EMIT_DEBUG_BLOCK_START(chunk, block_id)
+        
+        # Emit phi nodes first
+        FOR phi IN block->phi_nodes:
+            EMIT_PHI_NODE(chunk, phi)
+        END
+        
+        # Emit instructions
+        FOR insn IN block->instructions:
+            EMIT_INSTRUCTION_BYTES(chunk, insn)
+        END
+    END
+    
+    RETURN chunk
+END
+
+FUNCTION EMIT_INSTRUCTION_BYTES(chunk: BytecodeChunk*, 
+                               insn: Instruction*):
+    
+    # Ensure capacity
+    IF chunk->size + 16 > chunk->capacity:
+        GROW_CHUNK(chunk)
+    END
+    
+    # Emit opcode
+    chunk->code[chunk->size++] := insn->opcode
+    
+    # Emit SSA def ID if present
+    IF insn->ssa_def != nil:
+        EMIT_U32(chunk, insn->ssa_def->id)
+        MAP_SET(chunk->ssa_map, insn->ssa_def->id, chunk->size - 4)
+    END
+    
+    # Emit operands
+    chunk->code[chunk->size++] := insn->operands->size
+    FOR operand IN insn->operands:
+        EMIT_U32(chunk, operand->id)
+    END
+    
+    # Emit additional data based on opcode
+    MATCH insn->opcode:
+        CASE OP_CONST_INT, OP_CONST_FLOAT, OP_CONST_STRING:
+            EMIT_U32(chunk, insn->const_idx)
+            
+        CASE OP_JMP, OP_JMP_IF, OP_JMP_IFNOT:
+            EMIT_U32(chunk, insn->target)
+            
+        CASE OP_CALL, OP_CALL_METHOD:
+            EMIT_U16(chunk, insn->num_args)
+    END
+    
+    # Emit debug info
+    EMIT_LINE_INFO(chunk, insn->line)
+END
+
+########################################
+# SECTION 8 — MAIN COMPILER ENTRY
+########################################
+
+FUNCTION COMPILE_PROGRAM(ast: AST*, symtable: SymbolTable*,
+                        opt_level: u8) RETURNS Program*:
+    
+    # Build CFG from AST
+    cfg_builder := CREATE_CFG_BUILDER()
+    main_cfg := BUILD_CFG(cfg_builder, ast)
+    
+    # Compile main function
+    main_func := COMPILE_CFG(main_cfg, symtable, opt_level)
+    
+    # Compile all nested functions
+    functions := MAP_CREATE()
+    MAP_SET(functions, "main", main_func)
+    
+    FOR func_ast IN FIND_ALL_FUNCTIONS(ast):
+        func_cfg := BUILD_CFG(cfg_builder, func_ast)
+        func_bytecode := COMPILE_CFG(func_cfg, symtable, opt_level)
+        MAP_SET(functions, func_ast->name, func_bytecode)
+    END
+    
+    # Create program object
+    program := ALLOCATE(Program)
+    program->functions := functions
+    program->entry := main_func
+    program->globals := symtable
+    
+    # Serialize to bytecode if needed
+    IF SHOULD_SERIALIZE():
+        program->bytecode := SERIALIZE_PROGRAM(program)
+    END
+    
+    RETURN program
+END
+
+# Helper functions
+FUNCTION IS_CONSTANT(value: SSAValue*) RETURNS bool:
+    IF value->def_insn == nil:
+        RETURN false
+    END
+    
+    insn := GET_DEFINING_INSN(value)
+    RETURN insn->opcode >= OP_CONST_NIL AND 
+           insn->opcode <= OP_CONST_STRING
+END
+
+FUNCTION PRODUCES_VALUE(opcode: u8) RETURNS bool:
+    # Most opcodes produce values in SSA form
+    RETURN opcode != OP_NOP AND
+           opcode != OP_JMP AND
+           opcode != OP_RET AND
+           opcode != OP_THROW
+END
+
+# Export main compiler function
+EXPORT COMPILE_PROGRAM
+EXPORT CompiledFunction
+EXPORT BytecodeChunk
+

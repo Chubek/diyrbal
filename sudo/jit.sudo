@@ -1,0 +1,1067 @@
+LANGUAGE = "sudolang"
+
+############################################################
+#  DIYRBAL TRACING JIT COMPILER                           #
+#  Trace-based JIT compilation with type specialization   #
+############################################################
+
+########################################
+# SECTION 0 — CONSTANTS & TYPES
+########################################
+
+# JIT states
+CONST JIT_DISABLED     = 0      # JIT compilation disabled
+CONST JIT_PROFILING    = 1      # Profiling hot loops
+CONST JIT_TRACE_MODE   = 2      # Recording traces
+CONST JIT_COMPILING    = 3      # Compiling traces
+CONST JIT_EXECUTING    = 4      # Running compiled code
+
+# Trace limits
+CONST MAX_TRACE_LENGTH = 1000   # Maximum operations in trace
+CONST TRACE_THRESHOLD  = 50     # Iterations before tracing
+CONST SIDE_EXIT_LIMIT  = 10     # Max side exits before abort
+
+# Machine code constants
+CONST CODE_CACHE_SIZE  = 16 * 1024 * 1024  # 16MB code cache
+CONST TRACE_BUFFER_SIZE = 64 * 1024        # 64KB per trace
+
+# Optimization flags
+CONST OPT_INLINE       = 0x01   # Inline function calls
+CONST OPT_UNBOX        = 0x02   # Unbox numeric values
+CONST OPT_CONST_PROP   = 0x04   # Constant propagation
+CONST OPT_DEAD_CODE    = 0x08   # Dead code elimination
+CONST OPT_CSE          = 0x10   # Common subexpression elimination
+CONST OPT_LICM         = 0x20   # Loop invariant code motion
+CONST OPT_ESCAPE       = 0x40   # Escape analysis
+
+########################################
+# SECTION 1 — JIT STRUCTURES
+########################################
+
+STRUCT JITState:
+    # Global JIT state
+    mode        : u8                # Current JIT mode
+    cfg_cache   : Map<Proto*, ControlFlowGraph*>
+    
+    # Code generation
+    code_cache  : CodeCache*        # Machine code storage
+    assembler   : Assembler*        # Platform-specific assembler
+    
+    # Active traces
+    traces      : Map<u64, CompiledTrace*>  # PC -> compiled trace
+    trace_trees : Map<u64, TraceTree*>      # PC -> trace tree
+    
+    # Profiling
+    hot_counters: Map<u64, u32>     # PC -> execution count
+    recorder    : TraceRecorder*     # Current trace recorder
+    
+    # Statistics
+    stats       : JITStats          # Performance metrics
+END
+
+STRUCT CompiledTrace:
+    id          : u32               # Unique trace ID
+    entry_pc    : u64               # Entry point PC
+    
+    # Machine code
+    code        : u8*               # Native code buffer
+    code_size   : u32               # Size in bytes
+    
+    # Metadata
+    guards      : List<CompiledGuard> # Guard locations
+    constants   : List<Value>       # Embedded constants
+    
+    # Register allocation
+    reg_map     : RegisterMap       # Virtual -> physical mapping
+    spill_slots : u32               # Stack frame size
+    
+    # Deoptimization info
+    deopt_info  : List<DeoptPoint>  # Deopt metadata
+    
+    # Linking
+    calls       : List<CallSite>    # Direct call patches
+    exits       : List<ExitStub>    # Side exit stubs
+END
+
+STRUCT CompiledGuard:
+    pc          : u32               # Guard location in trace
+    type        : u8                # Guard type
+    
+    # Machine code location
+    code_offset : u32               # Offset in compiled code
+    patch_size  : u8                # Bytes to patch
+    
+    # Failure handling
+    exit_stub   : ExitStub*         # Exit handler
+    fail_count  : u32               # Failure counter
+END
+
+STRUCT DeoptPoint:
+    trace_pc    : u32               # Location in trace
+    vm_pc       : u64               # Original VM PC
+    
+    # State reconstruction
+    reg_state   : List<RegRestore>  # Register values
+    stack_depth : u32               # Operand stack depth
+    locals      : List<LocalRestore> # Local variables
+END
+
+########################################
+# SECTION 2 — TRACE RECORDING
+########################################
+
+STRUCT RecordingContext:
+    trace       : Trace*            # Current trace
+    start_pc    : u64               # Loop header PC
+    
+    # Type tracking
+    reg_types   : ARRAY<TypeInfo, 256>  # Register types
+    stack_types : List<TypeInfo>    # Stack types
+    
+    # Value tracking
+    known_values: Map<u8, Value>    # Constant values
+    
+    # Inlining context
+    inline_depth: u32               # Current inlining depth
+    call_stack  : List<InlineFrame> # Inlined calls
+END
+
+STRUCT InlineFrame:
+    caller_pc   : u64               # Call site in parent
+    callee      : Proto*            # Inlined function
+    return_reg  : u8                # Result register
+    
+    # Saved context
+    saved_regs  : ARRAY<Value, 16>  # Caller registers
+END
+
+FUNCTION START_JIT_RECORDING(vm: VM*, pc: u64):
+    state := vm->jit_state
+    
+    # Check if already traced
+    IF MAP_HAS(state->traces, pc):
+        # Execute compiled trace
+        trace := state->traces[pc]
+        EXECUTE_COMPILED_TRACE(vm, trace)
+        RETURN
+    END
+    
+    # Check if hot enough
+    count := state->hot_counters[pc]
+    IF count < TRACE_THRESHOLD:
+        state->hot_counters[pc] := count + 1
+        RETURN
+    END
+    
+    # Start recording
+    state->mode := JIT_TRACE_MODE
+    
+    recorder := ALLOC(TraceRecorder)
+    recorder->context := RecordingContext{
+        trace: ALLOC(Trace),
+        start_pc: pc,
+        inline_depth: 0
+    }
+    
+    # Initialize type info from current VM state
+    INIT_RECORDING_TYPES(recorder, vm)
+    
+    state->recorder := recorder
+END
+
+FUNCTION RECORD_OPERATION(vm: VM*, pc: u64, instr: u32):
+    state := vm->jit_state
+    IF state->mode != JIT_TRACE_MODE:
+        RETURN
+    END
+    
+    recorder := state->recorder
+    context := recorder->context
+    
+    # Create trace operation with type info
+    op := TraceOp{
+        pc: pc,
+        opcode: GET_OPCODE(instr),
+        operands: EXTRACT_OPERANDS(instr)
+    }
+    
+    # Record type information
+    RECORD_TYPES(context, &op, vm)
+    
+    # Handle special operations
+    CASE op.opcode OF:
+        OP_CALL:
+            # Consider inlining
+            target := GET_CALL_TARGET(vm, op)
+            IF SHOULD_INLINE(target, context):
+                INLINE_CALL(recorder, target, op)
+                RETURN
+            END
+            
+        OP_RETURN:
+            # Handle return from inlined call
+            IF context->inline_depth > 0:
+                HANDLE_INLINE_RETURN(recorder, op)
+                RETURN
+            END
+            
+        OP_JMPIF, OP_JMPNIF:
+            # Record branch direction
+            taken := EVALUATE_BRANCH(vm, op)
+            RECORD_GUARD(recorder, GUARD_BRANCH, taken)
+            
+        OP_GETATTR, OP_SETATTR:
+            # Record shape guard
+            obj := vm->regs[op.operands[1]].as_pointer
+            shape := GET_OBJECT_SHAPE(obj)
+            RECORD_SHAPE_GUARD(recorder, op.operands[1], shape)
+    END
+    
+    # Add to trace
+    LIST_APPEND(context->trace->path, op)
+    
+    # Check trace completion
+    IF pc == context->start_pc AND context->trace->path.size > 1:
+        # Loop completed
+        COMPLETE_TRACE(recorder)
+    ELSIF context->trace->path.size >= MAX_TRACE_LENGTH:
+        # Trace too long, abort
+        ABORT_TRACE(recorder)
+    END
+END
+
+FUNCTION RECORD_TYPES(context: RecordingContext*, op: TraceOp*, vm: VM*):
+    # Record input types
+    FOR i := 1 TO GET_NUM_INPUTS(op->opcode):
+        reg := op->operands[i]
+        type_info := GET_TYPE_INFO(vm->regs[reg])
+        op->types[i] := type_info
+        context->reg_types[reg] := type_info
+    END
+    
+    # Compute output type
+    IF HAS_OUTPUT(op->opcode):
+        out_reg := op->operands[0]
+        out_type := COMPUTE_OUTPUT_TYPE(op)
+        op->types[0] := out_type
+        context->reg_types[out_reg] := out_type
+        
+        # Track constant values
+        IF IS_CONSTANT_OP(op):
+            value := COMPUTE_CONSTANT_VALUE(op)
+            context->known_values[out_reg] := value
+        END
+    END
+END
+
+########################################
+# SECTION 3 — GUARD GENERATION
+########################################
+
+FUNCTION RECORD_GUARD(recorder: TraceRecorder*, type: u8, data: GuardData):
+    guard := Guard{
+        type: type,
+        pc: recorder->context->trace->path.size,
+        condition: data
+    }
+    
+    LIST_APPEND(recorder->context->trace->guards, guard)
+END
+
+FUNCTION RECORD_SHAPE_GUARD(recorder: TraceRecorder*, reg: u8, shape: Shape*):
+    data := GuardData{
+        shape_check: {
+            reg: reg,
+            expected: shape
+        }
+    }
+    
+    RECORD_GUARD(recorder, GUARD_SHAPE, data)
+END
+
+FUNCTION GENERATE_GUARD_CODE(asm: Assembler*, guard: Guard*, 
+                            exit_stub: ExitStub*):
+    CASE guard->type OF:
+        GUARD_TYPE:
+            # Generate type check
+            check := guard->condition.type_check
+            ASM_LOAD_TAG(asm, TEMP_REG1, check.reg)
+            ASM_CMP_IMM(asm, TEMP_REG1, check.expected)
+            ASM_JNE(asm, exit_stub->address)
+            
+        GUARD_SHAPE:
+            # Generate shape check
+            check := guard->condition.shape_check
+            ASM_LOAD_FIELD(asm, TEMP_REG1, check.reg, OFFSET_SHAPE)
+            ASM_CMP_IMM(asm, TEMP_REG1, check.expected)
+            ASM_JNE(asm, exit_stub->address)
+            
+        GUARD_BRANCH:
+            # Generate branch check
+            check := guard->condition.branch_check
+            ASM_TEST(asm, check.reg)
+            IF check.expected:
+                ASM_JZ(asm, exit_stub->address)
+            ELSE:
+                ASM_JNZ(asm, exit_stub->address)
+            END
+            
+        GUARD_OVERFLOW:
+            # Check overflow flag
+            ASM_JO(asm, exit_stub->address)
+            
+        GUARD_BOUNDS:
+            # Array bounds check
+            check := guard->condition.bounds_check
+            ASM_CMP(asm, check.index, check.length)
+            ASM_JAE(asm, exit_stub->address)
+    END
+END
+
+########################################
+# SECTION 4 — TRACE COMPILATION
+########################################
+
+FUNCTION COMPILE_TRACE(trace: Trace*) RETURNS CompiledTrace*:
+    compiled := ALLOC(CompiledTrace)
+    compiled->id := trace->id
+    compiled->entry_pc := trace->start_block->start_pc
+    
+    # Allocate code buffer
+    buffer := ALLOC_CODE_BUFFER(TRACE_BUFFER_SIZE)
+    asm := CREATE_ASSEMBLER(buffer)
+    
+    # Generate prologue
+    GENERATE_PROLOGUE(asm, compiled)
+    
+    # Allocate registers
+    reg_alloc := ALLOCATE_REGISTERS(trace)
+    compiled->reg_map := reg_alloc.mapping
+    compiled->spill_slots := reg_alloc.spills
+    
+    # Compile operations
+    FOR i, op IN ENUMERATE(trace->path):
+        # Record deopt point
+        deopt := DeoptPoint{
+            trace_pc: i,
+            vm_pc: op.pc
+        }
+        LIST_APPEND(compiled->deopt_info, deopt)
+        
+        # Generate guards
+        guards := FIND_GUARDS_AT(trace, i)
+        FOR guard IN guards:
+            exit_stub := CREATE_EXIT_STUB(compiled, i, guard)
+            GENERATE_GUARD_CODE(asm, guard, exit_stub)
+        END
+        
+        # Generate operation
+        COMPILE_OPERATION(asm, op, reg_alloc)
+    END
+    
+    # Generate epilogue/loop jump
+    GENERATE_EPILOGUE(asm, compiled)
+    
+    # Finalize code
+    compiled->code := buffer
+    compiled->code_size := asm->position
+    
+    # Make executable
+    MAKE_CODE_EXECUTABLE(compiled->code, compiled->code_size)
+    
+    RETURN compiled
+END
+
+FUNCTION COMPILE_OPERATION(asm: Assembler*, op: TraceOp*, 
+                          reg_alloc: RegisterAllocation):
+    # Get physical registers
+    phys_regs := ARRAY<u8, 3>()
+    FOR i := 0 TO 2:
+        virt := op.operands[i]
+        phys_regs[i] := GET_PHYSICAL_REG(reg_alloc, virt)
+    END
+    
+    # Type-specialized code generation
+    CASE op.opcode OF:
+        OP_ADD:
+            IF op.types[1].tag == TYPE_INT48:
+                # Fast path for integers
+                ASM_ADD_INT48(asm, phys_regs[0], phys_regs[1], phys_regs[2])
+            ELSE:
+                # Generic add with overflow check
+                ASM_CALL_HELPER(asm, HELPER_GENERIC_ADD)
+            END
+            
+        OP_LOADK:
+            # Load constant directly
+            const_idx := GET_IMM16(op.raw_instr)
+            value := op.const_prop
+            IF IS_SMALL_CONSTANT(value):
+                ASM_MOV_IMM(asm, phys_regs[0], value.raw)
+            ELSE:
+                # Load from constant pool
+                ASM_LOAD_CONST(asm, phys_regs[0], const_idx)
+            END
+            
+        OP_GETATTR:
+            IF op.types[1].tag == TYPE_POINTER:
+                # Optimized attribute access
+                shape := op.guard_data.shape
+                offset := GET_ATTR_OFFSET(shape, op.attr_id)
+                ASM_LOAD_FIELD(asm, phys_regs[0], phys_regs[1], offset)
+            ELSE:
+                # Slow path
+                ASM_CALL_HELPER(asm, HELPER_GETATTR)
+            END
+            
+        OP_CALL:
+            # Direct call if possible
+            IF op.call_target != nil:
+                ASM_CALL_DIRECT(asm, op.call_target)
+            ELSE:
+                ASM_CALL_INDIRECT(asm, phys_regs[1])
+            END
+            
+        OP_RETURN:
+            # Move result to return register
+            ASM_MOV(asm, RETURN_REG, phys_regs[0])
+            ASM_JMP(asm, EPILOGUE_LABEL)
+    END
+END
+
+########################################
+# SECTION 5 — REGISTER ALLOCATION
+########################################
+
+STRUCT RegisterAllocation:
+    mapping     : Map<u8, u8>       # Virtual -> physical
+    spills      : u32               # Spilled registers
+    
+    # Live ranges
+    intervals   : List<LiveInterval>
+    
+    # Machine info
+    num_regs    : u8                # Available registers
+    reserved    : BitSet            # Reserved registers
+END
+
+STRUCT LiveInterval:
+    vreg        : u8                # Virtual register
+    start       : u32               # First use
+    end         : u32               # Last use
+    
+    # Assignment
+    preg        : u8                # Physical register
+    spilled     : bool              # Spilled to stack
+    spill_slot  : u32               # Stack location
+END
+
+FUNCTION ALLOCATE_REGISTERS(trace: Trace*) RETURNS RegisterAllocation:
+    alloc := RegisterAllocation{
+        mapping: Map<u8, u8>(),
+        num_regs: MACHINE_NUM_REGS,
+        reserved: MACHINE_RESERVED_REGS
+    }
+    
+    # Compute live intervals
+    intervals := COMPUTE_LIVE_INTERVALS(trace)
+    alloc.intervals := intervals
+    
+    # Linear scan allocation
+    active := List<LiveInterval*>()
+    
+    FOR interval IN SORT_BY_START(intervals):
+        # Expire old intervals
+        EXPIRE_OLD_INTERVALS(&active, interval.start)
+        
+        # Find available register
+        IF active.size >= alloc.num_regs - POPCOUNT(alloc.reserved):
+            # Need to spill
+            spill := FIND_SPILL_CANDIDATE(&active, interval)
+            IF spill->end > interval.end:
+                # Spill other interval
+                SPILL_INTERVAL(spill, &alloc)
+                LIST_REMOVE(&active, spill)
+                interval.preg := spill->preg
+                LIST_ADD_SORTED(&active, interval)
+            ELSE:
+                # Spill current interval
+                SPILL_INTERVAL(interval, &alloc)
+            END
+        ELSE:
+            # Assign free register
+            interval.preg := FIND_FREE_REGISTER(&active, alloc)
+            LIST_ADD_SORTED(&active, interval)
+        END
+        
+        # Update mapping
+        alloc.mapping[interval.vreg] := interval.preg
+    END
+    
+    RETURN alloc
+END
+
+########################################
+# SECTION 6 — INLINE CACHING
+########################################
+
+STRUCT InlineCache:
+    # Polymorphic inline cache
+    entries     : ARRAY<ICEntry, 4>  # Cache entries
+    count       : u8                 # Used entries
+    
+    # Fallback
+    miss_handler: Address            # Cache miss handler
+END
+
+STRUCT ICEntry:
+    guard_value : Value              # Guard (class/shape)
+    target      : Address            # Target address
+    
+    # Statistics
+    hit_count   : u32                # Cache hits
+END
+
+FUNCTION GENERATE_INLINE_CACHE(asm: Assembler*, cache: InlineCache*, 
+                              test_reg: u8):
+    # Generate linear cache probe
+    FOR i := 0 TO cache->count - 1:
+        entry := &cache->entries[i]
+        
+        # Compare guard
+        ASM_CMP_IMM(asm, test_reg, entry->guard_value.raw)
+        ASM_JE(asm, entry->target)
+    END
+    
+    # Cache miss
+    ASM_JMP(asm, cache->miss_handler)
+END
+
+FUNCTION UPDATE_INLINE_CACHE(cache: InlineCache*, guard: Value, 
+                            target: Address):
+    # Check if already cached
+    FOR i := 0 TO cache->count - 1:
+        IF cache->entries[i].guard_value.raw == guard.raw:
+            cache->entries[i].hit_count++
+            RETURN
+        END
+    END
+    
+    # Add new entry
+    IF cache->count < 4:
+        cache->entries[cache->count] := ICEntry{
+            guard_value: guard,
+            target: target,
+            hit_count: 1
+        }
+        cache->count++
+    ELSE:
+        # Replace least recently used
+        min_idx := 0
+        min_hits := cache->entries[0].hit_count
+        
+        FOR i := 1 TO 3:
+            IF cache->entries[i].hit_count < min_hits:
+                min_idx := i
+                min_hits := cache->entries[i].hit_count
+            END
+        END
+        
+        cache->entries[min_idx] := ICEntry{
+            guard_value: guard,
+            target: target,
+            hit_count: 1
+        }
+    END
+END
+
+########################################
+# SECTION 7 — SIDE EXITS & DEOPT
+########################################
+
+STRUCT ExitStub:
+    id          : u32                # Exit ID
+    trace_pc    : u32                # Position in trace
+    
+    # Generated code
+    stub_code   : Address            # Stub entry point
+    
+    # Deoptimization
+    deopt_info  : DeoptPoint*        # State reconstruction
+    
+    # Trace tree extension
+    branch_count: u32                # Times taken
+    branch_trace: CompiledTrace*     # Branch trace (if any)
+END
+
+FUNCTION CREATE_EXIT_STUB(compiled: CompiledTrace*, pc: u32, 
+                         guard: Guard*) RETURNS ExitStub*:
+    stub := ALLOC(ExitStub)
+    stub->id := NEXT_EXIT_ID()
+    stub->trace_pc := pc
+    stub->deopt_info := &compiled->deopt_info[pc]
+    
+    # Generate stub code
+    buffer := ALLOC_STUB_BUFFER()
+    asm := CREATE_ASSEMBLER(buffer)
+    
+    # Save machine state
+    ASM_PUSH_ALL_REGS(asm)
+    
+    # Call deoptimization handler
+    ASM_MOV_IMM(asm, ARG_REG1, stub AS uptr)
+    ASM_MOV_IMM(asm, ARG_REG2, compiled AS uptr)
+    ASM_CALL(asm, DEOPT_HANDLER)
+    
+    # Handler returns target address
+    ASM_JMP_INDIRECT(asm, RETURN_REG)
+    
+    stub->stub_code := buffer
+    MAKE_CODE_EXECUTABLE(buffer, asm->position)
+    
+    LIST_APPEND(compiled->exits, stub)
+    RETURN stub
+END
+
+FUNCTION DEOPT_HANDLER(stub: ExitStub*, compiled: CompiledTrace*) 
+    RETURNS Address:
+    vm := CURRENT_VM()
+    deopt := stub->deopt_info
+    
+    # Restore VM state
+    RESTORE_REGISTERS(vm, deopt->reg_state)
+    RESTORE_STACK(vm, deopt->stack_depth)
+    RESTORE_LOCALS(vm, deopt->locals)
+    
+    # Update PC
+    vm->pc := deopt->vm_pc
+    
+    # Check for trace tree extension
+    stub->branch_count++
+    IF stub->branch_count > BRANCH_TRACE_THRESHOLD:
+        IF stub->branch_trace == nil:
+            # Start branch trace
+            START_BRANCH_TRACE(vm, stub)
+        ELSE:
+            # Execute branch trace
+            RETURN stub->branch_trace->code
+        END
+    END
+    
+    # Return to interpreter
+    vm->jit_state->mode := JIT_PROFILING
+    RETURN VM_INTERPRETER_ENTRY
+END
+
+########################################
+# SECTION 8 — OPTIMIZATIONS
+########################################
+
+FUNCTION OPTIMIZE_TRACE(trace: Trace*, level: u32):
+    IF level & OPT_CONST_PROP:
+        CONSTANT_PROPAGATION(trace)
+    END
+    
+    IF level & OPT_DEAD_CODE:
+        DEAD_CODE_ELIMINATION(trace)
+    END
+    
+    IF level & OPT_CSE:
+        COMMON_SUBEXPR_ELIMINATION(trace)
+    END
+    
+    IF level & OPT_LICM:
+        LOOP_INVARIANT_CODE_MOTION(trace)
+    END
+    
+    IF level & OPT_ESCAPE:
+        ESCAPE_ANALYSIS(trace)
+    END
+    
+    IF level & OPT_UNBOX:
+        UNBOX_NUMERIC_VALUES(trace)
+    END
+END
+
+FUNCTION CONSTANT_PROPAGATION(trace: Trace*):
+    constants := Map<u8, Value>()
+    
+    FOR op IN trace->path:
+        CASE op.opcode OF:
+            OP_LOADK:
+                # Record constant
+                constants[op.operands[0]] := op.const_value
+                
+            OP_ADD, OP_SUB, OP_MUL, OP_DIV:
+                # Check for constant operands
+                IF MAP_HAS(constants, op.operands[1]) AND
+                   MAP_HAS(constants, op.operands[2]):
+                    # Fold operation
+                    result := FOLD_BINARY_OP(
+                        op.opcode,
+                        constants[op.operands[1]],
+                        constants[op.operands[2]]
+                    )
+                    
+                    # Replace with load constant
+                    op.opcode := OP_LOADK
+                    op.const_value := result
+                    constants[op.operands[0]] := result
+                END
+                
+            OP_MOV:
+                # Propagate through moves
+                IF MAP_HAS(constants, op.operands[1]):
+                    constants[op.operands[0]] := constants[op.operands[1]]
+                END
+        END
+    END
+END
+
+FUNCTION ESCAPE_ANALYSIS(trace: Trace*):
+    # Find allocations that don't escape
+    allocations := Map<u8, AllocationInfo>()
+    
+    FOR op IN trace->path:
+        IF op.opcode == OP_NEWTABLE OR op.opcode == OP_NEWOBJECT:
+            allocations[op.operands[0]] := AllocationInfo{
+                pc: op.pc,
+                escapes: false,
+                fields: Map<u32, u8>()
+            }
+        END
+    END
+    
+    # Check for escapes
+    FOR op IN trace->path:
+        CASE op.opcode OF:
+            OP_SETATTR:
+                obj_reg := op.operands[1]
+                IF MAP_HAS(allocations, obj_reg):
+                    # Track field write
+                    field_id := op.attr_id
+                    value_reg := op.operands[2]
+                    allocations[obj_reg].fields[field_id] := value_reg
+                END
+                
+            OP_GETATTR:
+                obj_reg := op.operands[1]
+                IF MAP_HAS(allocations, obj_reg):
+                    # Can replace with field access
+                    field_id := op.attr_id
+                    IF MAP_HAS(allocations[obj_reg].fields, field_id):
+                        # Replace with move
+                        op.opcode := OP_MOV
+                        op.operands[1] := allocations[obj_reg].fields[field_id]
+                    END
+                END
+                
+            OP_CALL, OP_RETURN:
+                # Check if allocation escapes
+                FOR i := 0 TO GET_NUM_ARGS(op.opcode):
+                    IF MAP_HAS(allocations, op.operands[i]):
+                        allocations[op.operands[i]].escapes := true
+                    END
+                END
+        END
+    END
+    
+    # Remove non-escaping allocations
+    FOR reg, info IN allocations:
+        IF NOT info.escapes:
+            # Remove allocation
+            MARK_FOR_REMOVAL(trace, info.pc)
+        END
+    END
+END
+
+########################################
+# SECTION 9 — MACHINE CODE GENERATION
+########################################
+
+STRUCT Assembler:
+    buffer      : u8*                # Code buffer
+    position    : u32                # Current position
+    capacity    : u32                # Buffer size
+    
+    # Label management
+    labels      : Map<u32, u32>      # Label -> offset
+    fixups      : List<Fixup>        # Forward references
+    
+    # Platform info
+    arch        : Architecture       # Target architecture
+END
+
+STRUCT Fixup:
+    position    : u32                # Position to patch
+    label       : u32                # Target label
+    type        : u8                 # Fixup type
+END
+
+# Platform-specific code generation
+FUNCTION ASM_ADD_INT48(asm: Assembler*, dst: u8, src1: u8, src2: u8):
+    CASE asm->arch OF:
+        ARCH_X64:
+            # x64: add with overflow check
+            EMIT_REX_PREFIX(asm, dst, src1)
+            EMIT_BYTE(asm, 0x01)  # ADD r/m64, r64
+            EMIT_MODRM(asm, src2, dst)
+            
+        ARCH_ARM64:
+            # ARM64: adds with condition flags
+            encoding := ARM64_ADDS(dst, src1, src2)
+            EMIT_U32(asm, encoding)
+            
+        ARCH_RISCV64:
+            # RISC-V: add with overflow check
+            EMIT_U32(asm, RISCV_ADD(dst, src1, src2))
+            EMIT_U32(asm, RISCV_BLT(dst, src1, OVERFLOW_LABEL))
+    END
+END
+
+FUNCTION ASM_LOAD_TAG(asm: Assembler*, dst: u8, src: u8):
+    CASE asm->arch OF:
+        ARCH_X64:
+            # Extract tag from tagged value
+            EMIT_REX_PREFIX(asm, dst, src)
+            EMIT_BYTES(asm, [0x48, 0x89, 0xC0 + (src << 3) + dst])  # MOV
+            EMIT_REX_PREFIX(asm, dst, dst)
+            EMIT_BYTES(asm, [0x48, 0xC1, 0xE8 + dst, 48])  # SHR 48
+            
+        ARCH_ARM64:
+            # Use bitfield extract
+            encoding := ARM64_UBFX(dst, src, 48, 16)
+            EMIT_U32(asm, encoding)
+    END
+END
+
+########################################
+# SECTION 10 — CODE CACHE MANAGEMENT
+########################################
+
+STRUCT CodeCache:
+    memory      : u8*                # Allocated memory
+    size        : usize              # Total size
+    used        : usize              # Used bytes
+    
+    # Allocation tracking
+    traces      : List<CodeRange>    # Allocated ranges
+    free_list   : List<CodeRange>    # Free ranges
+    
+    # GC support
+    gc_threshold: usize              # Trigger GC
+    gc_count    : u32                # GC runs
+END
+
+STRUCT CodeRange:
+    start       : u8*                # Start address
+    size        : usize              # Size in bytes
+    trace_id    : u32                # Owner trace
+    
+    # Linking
+    next        : CodeRange*         # Next in list
+    prev        : CodeRange*         # Previous in list
+END
+
+FUNCTION ALLOC_CODE_BUFFER(size: usize) RETURNS u8*:
+    cache := GLOBAL_CODE_CACHE()
+    
+    # Try to allocate from cache
+    range := FIND_FREE_RANGE(cache, size)
+    IF range != nil:
+        # Split range if needed
+        IF range->size > size + MIN_FRAGMENT_SIZE:
+            SPLIT_RANGE(range, size)
+        END
+        
+        # Mark as used
+        REMOVE_FROM_FREE_LIST(cache, range)
+        LIST_APPEND(cache->traces, range)
+        
+        RETURN range->start
+    END
+    
+    # Need garbage collection
+    IF cache->used + size > cache->gc_threshold:
+        COLLECT_CODE_GARBAGE(cache)
+        
+        # Retry allocation
+        range := FIND_FREE_RANGE(cache, size)
+        IF range != nil:
+            RETURN ALLOC_CODE_BUFFER(size)  # Retry
+        END
+    END
+    
+    # Out of space
+    ERROR("Code cache exhausted")
+    RETURN nil
+END
+
+FUNCTION COLLECT_CODE_GARBAGE(cache: CodeCache*):
+    # Mark live traces
+    live := Set<u32>()
+    vm := CURRENT_VM()
+    
+    # Mark from active traces
+    FOR pc, trace IN vm->jit_state->traces:
+        SET_ADD(live, trace->id)
+    END
+    
+    # Mark from trace trees
+    FOR pc, tree IN vm->jit_state->trace_trees:
+        MARK_TRACE_TREE_LIVE(tree, &live)
+    END
+    
+    # Sweep dead traces
+    new_traces := List<CodeRange>()
+    FOR range IN cache->traces:
+        IF SET_CONTAINS(live, range->trace_id):
+            LIST_APPEND(new_traces, range)
+        ELSE:
+            # Return to free list
+            LIST_APPEND(cache->free_list, range)
+            cache->used -= range->size
+        END
+    END
+    
+    cache->traces := new_traces
+    cache->gc_count++
+    
+    # Coalesce free ranges
+    COALESCE_FREE_RANGES(cache)
+END
+
+########################################
+# SECTION 11 — TRACE EXECUTION
+########################################
+
+FUNCTION EXECUTE_COMPILED_TRACE(vm: VM*, trace: CompiledTrace*):
+    # Save interpreter state
+    saved_state := VMState{
+        pc: vm->pc,
+        regs: COPY_REGISTERS(vm->regs),
+        stack: COPY_STACK(vm->stack),
+        mode: vm->jit_state->mode
+    }
+    
+    # Set JIT mode
+    vm->jit_state->mode := JIT_EXECUTING
+    
+    # Call compiled code
+    # The trace returns the exit reason
+    exit_reason := CALL_MACHINE_CODE(
+        trace->code,
+        vm AS uptr,
+        vm->regs AS uptr
+    )
+    
+    CASE exit_reason OF:
+        EXIT_LOOP_COMPLETE:
+            # Normal loop completion
+            vm->pc := trace->exit_pc
+            
+        EXIT_GUARD_FAILURE:
+            # Guard failed, already deoptimized
+            PASS
+            
+        EXIT_SIDE_EXIT:
+            # Took side exit
+            # State already restored by deopt handler
+            PASS
+            
+        EXIT_EXCEPTION:
+            # Exception thrown in compiled code
+            # Restore state and propagate
+            RESTORE_VM_STATE(vm, &saved_state)
+            PROPAGATE_EXCEPTION(vm)
+    END
+    
+    # Update statistics
+    vm->jit_state->stats.traces_executed++
+END
+
+# Machine code calling convention
+FUNCTION CALL_MACHINE_CODE(code: Address, vm_ptr: uptr, 
+                          regs_ptr: uptr) RETURNS u32:
+    # Platform-specific calling convention
+    PLATFORM_CALL_CODE(code, vm_ptr, regs_ptr)
+END
+
+########################################
+# SECTION 12 — JIT STATISTICS
+########################################
+
+STRUCT JITStats:
+    # Compilation stats
+    traces_recorded : u64            # Total traces recorded
+    traces_compiled : u64            # Successfully compiled
+    traces_aborted  : u64            # Aborted traces
+    
+    # Execution stats
+    traces_executed : u64            # Trace executions
+    guard_failures  : u64            # Total guard failures
+    side_exits      : u64            # Side exits taken
+    
+    # Code stats
+    code_bytes      : u64            # Generated code size
+    compile_time    : u64            # Time spent compiling
+    
+    # Optimization stats
+    constants_folded: u64            # Constant operations
+    guards_removed  : u64            # Eliminated guards
+    allocations_removed: u64         # Escape analysis wins
+END
+
+FUNCTION PRINT_JIT_STATS(stats: JITStats*):
+    PRINT("=== JIT Statistics ===")
+    PRINT("Traces: recorded=%llu compiled=%llu aborted=%llu",
+          stats->traces_recorded, stats->traces_compiled, 
+          stats->traces_aborted)
+    PRINT("Execution: traces=%llu guards=%llu exits=%llu",
+          stats->traces_executed, stats->guard_failures,
+          stats->side_exits)
+    PRINT("Code: %llu bytes in %llu ms",
+          stats->code_bytes, stats->compile_time)
+    PRINT("Optimizations: const=%llu guards=%llu allocs=%llu",
+          stats->constants_folded, stats->guards_removed,
+          stats->allocations_removed)
+END
+
+########################################
+# APPENDIX — INTEGRATION WITH VM
+########################################
+
+# VM hooks for JIT integration
+
+FUNCTION VM_CHECK_LOOP_HEADER(vm: VM*, pc: u64):
+    # Called at backward branches
+    IF vm->jit_state->mode == JIT_PROFILING:
+        IF IS_LOOP_HEADER(vm, pc):
+            START_JIT_RECORDING(vm, pc)
+        END
+    ELSIF vm->jit_state->mode == JIT_TRACE_MODE:
+        IF pc == vm->jit_state->recorder->context->start_pc:
+            # Loop closed
+            COMPLETE_TRACE(vm->jit_state->recorder)
+        END
+    END
+END
+
+FUNCTION VM_EXECUTE_INSTRUCTION(vm: VM*, instr: u32):
+    IF vm->jit_state->mode == JIT_TRACE_MODE:
+        RECORD_OPERATION(vm, vm->pc, instr)
+    END
+    
+    # Normal interpretation continues...
+END
+
+# Platform-specific architecture constants
+CONST ARCH_X64     = 1
+CONST ARCH_ARM64   = 2  
+CONST ARCH_RISCV64 = 3
+
+# Machine register counts
+CONST X64_NUM_REGS = 16
+CONST ARM64_NUM_REGS = 32
+CONST RISCV_NUM_REGS = 32
+

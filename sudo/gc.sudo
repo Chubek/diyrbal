@@ -1,0 +1,1031 @@
+LANGUAGE = "pseudocode"        # ← Diyrbal threaded mark & compact GC in Sudolang
+
+############################################################
+#  DIYRBAL THREADED MARK & COMPACT GARBAGE COLLECTOR      #
+#  Focus: low fragmentation, cache-friendly compaction    #
+############################################################
+
+########################################
+# SECTION 0 — DESIGN PHILOSOPHY & GOALS
+########################################
+#  • Threaded compaction using Jonkers' algorithm
+#  • Two-pass mark-compact with threading phase
+#  • Supports pinned objects (non-movable)
+#  • Precise stack scanning with safe points
+#  • Generational support (young/old spaces)
+#  • Write barrier for incremental operation
+#  • Allocation color (black allocation during marking)
+
+CONST WORD_SIZE         = 8           # 64-bit words
+CONST MIN_OBJECT_SIZE   = 16          # 2 words minimum
+CONST BLOCK_SIZE        = 65536       # 64 KiB blocks
+CONST MARK_STACK_SIZE   = 16384       # initial mark stack
+CONST THREAD_OFFSET     = 0x8000000000000000  # MSB for threading
+
+# Object header bits (64-bit header):
+CONST MARK_BIT          = 0x01        # marked (reachable)
+CONST PINNED_BIT        = 0x02        # cannot move
+CONST FORWARDED_BIT     = 0x04        # has forwarding address
+CONST FINALIZER_BIT     = 0x08        # has finalizer
+CONST LARGE_BIT         = 0x10        # large object
+CONST REMEMBERED_BIT    = 0x20        # in remembered set
+CONST AGE_BITS          = 0x1C0       # 3 bits for age (0-7)
+CONST AGE_SHIFT         = 6
+
+# GC states:
+CONST GC_IDLE           = 0
+CONST GC_MARKING        = 1
+CONST GC_THREADING      = 2
+CONST GC_UPDATING       = 3
+CONST GC_COMPACTING     = 4
+CONST GC_SWEEPING       = 5
+
+# Write barrier modes:
+CONST WB_NONE           = 0           # no barrier active
+CONST WB_SNAPSHOT       = 1           # snapshot-at-beginning
+CONST WB_INCREMENTAL    = 2           # incremental update
+
+######################################
+# SECTION 1 — CORE DATA STRUCTURES
+######################################
+
+STRUCT ObjectHeader:
+    # Format: [size:48][flags:8][gc_bits:8]
+    header : u64
+    
+    # During threading phase, objects use this space for thread pointer
+    # Normal operation: points to class/type info
+    klass_or_thread : ptr[void]
+END
+
+STRUCT HeapBlock:
+    start     : ptr[u8]       # block memory start
+    end       : ptr[u8]       # block memory end
+    free      : ptr[u8]       # allocation pointer
+    
+    # Block metadata:
+    next      : ptr[HeapBlock]
+    prev      : ptr[HeapBlock]
+    
+    # Compaction state:
+    compact_dest : ptr[u8]    # where objects will move to
+    
+    # Statistics:
+    live_bytes   : usize      # bytes of live objects
+    num_objects  : u32        # total objects
+    num_pinned   : u32        # pinned objects
+END
+
+STRUCT Generation:
+    name        : string
+    blocks      : ptr[HeapBlock]  # linked list of blocks
+    num_blocks  : u32
+    
+    # Space bounds:
+    start       : ptr[u8]
+    end         : ptr[u8]
+    used        : usize
+    capacity    : usize
+    
+    # Allocation:
+    alloc_block : ptr[HeapBlock]  # current allocation block
+    alloc_color : u8              # color for new allocations
+    
+    # Collection policy:
+    threshold   : usize           # bytes to trigger GC
+    target_ratio: f32             # target live/total ratio
+END
+
+STRUCT GCState:
+    # Heap structure:
+    young_gen   : Generation
+    old_gen     : Generation
+    large_space : ptr[HeapBlock]  # large object space
+    
+    # GC phase:
+    phase       : u8
+    cycle       : u64             # GC cycle number
+    
+    # Marking:
+    mark_stack  : DynamicArray[ptr[ObjectHeader]]
+    mark_overflow : bool
+    work_list   : ptr[WorkPacket]  # for parallel marking
+    
+    # Root set:
+    roots       : DynamicArray[ptr[ptr[ObjectHeader]]]
+    stack_roots : DynamicArray[StackRoot]
+    
+    # Write barrier:
+    barrier_mode : u8
+    remembered_set : HashSet[ptr[ObjectHeader]]
+    card_table  : ptr[u8]        # byte per 512 bytes of heap
+    
+    # Threading state:
+    thread_finger : ptr[ObjectHeader]  # current threading position
+    
+    # Statistics:
+    total_allocated : u64
+    total_collected : u64
+    mark_time_ms   : u32
+    compact_time_ms: u32
+    
+    # Configuration:
+    incremental   : bool          # incremental collection
+    parallel      : bool          # parallel marking
+    num_threads   : u32           # worker thread count
+END
+
+STRUCT StackRoot:
+    location : ptr[ptr[ObjectHeader]]  # pointer location on stack
+    frame    : ptr[void]               # stack frame info
+END
+
+STRUCT WorkPacket:
+    objects  : Array[64, ptr[ObjectHeader]]
+    count    : u32
+    next     : ptr[WorkPacket]
+END
+
+GLOBAL GC : GCState
+
+######################################
+# SECTION 2 — OBJECT LAYOUT & ACCESS
+######################################
+
+FUNCTION GetObjectSize(obj: ptr[ObjectHeader]) RETURNS usize:
+    RETURN (obj.header >> 16) AND 0xFFFFFFFFFFFF
+END
+
+FUNCTION GetObjectFlags(obj: ptr[ObjectHeader]) RETURNS u8:
+    RETURN (obj.header >> 8) AND 0xFF
+END
+
+FUNCTION GetObjectGCBits(obj: ptr[ObjectHeader]) RETURNS u8:
+    RETURN obj.header AND 0xFF
+END
+
+FUNCTION SetObjectSize(obj: ptr[ObjectHeader], size: usize):
+    obj.header := (obj.header AND 0xFFFF) OR (size << 16)
+END
+
+FUNCTION SetObjectFlag(obj: ptr[ObjectHeader], flag: u8):
+    obj.header := obj.header OR (flag AS u64)
+END
+
+FUNCTION ClearObjectFlag(obj: ptr[ObjectHeader], flag: u8):
+    obj.header := obj.header AND (NOT (flag AS u64))
+END
+
+FUNCTION IsMarked(obj: ptr[ObjectHeader]) RETURNS bool:
+    RETURN (GetObjectGCBits(obj) AND MARK_BIT) != 0
+END
+
+FUNCTION IsPinned(obj: ptr[ObjectHeader]) RETURNS bool:
+    RETURN (GetObjectGCBits(obj) AND PINNED_BIT) != 0
+END
+
+FUNCTION IsForwarded(obj: ptr[ObjectHeader]) RETURNS bool:
+    RETURN (GetObjectGCBits(obj) AND FORWARDED_BIT) != 0
+END
+
+FUNCTION GetForwardingAddress(obj: ptr[ObjectHeader]) RETURNS ptr[ObjectHeader]:
+    IF NOT IsForwarded(obj):
+        RETURN obj
+    END
+    # Forwarding address stored in first word after header
+    RETURN *((obj + 1) AS ptr[ptr[ObjectHeader]])
+END
+
+FUNCTION SetForwardingAddress(obj: ptr[ObjectHeader], new_addr: ptr[ObjectHeader]):
+    SetObjectFlag(obj, FORWARDED_BIT)
+    *((obj + 1) AS ptr[ptr[ObjectHeader]]) := new_addr
+END
+
+# Threading helpers:
+FUNCTION IsThreaded(obj: ptr[ObjectHeader]) RETURNS bool:
+    RETURN (obj.klass_or_thread AS usize) >= THREAD_OFFSET
+END
+
+FUNCTION GetThreadNext(obj: ptr[ObjectHeader]) RETURNS ptr[ObjectHeader]:
+    IF NOT IsThreaded(obj):
+        RETURN null
+    END
+    RETURN ((obj.klass_or_thread AS usize) AND (NOT THREAD_OFFSET)) AS ptr[ObjectHeader]
+END
+
+FUNCTION SetThreadNext(obj: ptr[ObjectHeader], next: ptr[ObjectHeader]):
+    obj.klass_or_thread := ((next AS usize) OR THREAD_OFFSET) AS ptr[void]
+END
+
+######################################
+# SECTION 3 — HEAP MANAGEMENT
+######################################
+
+FUNCTION InitializeHeap(young_size: usize, old_size: usize):
+    # Initialize generations
+    GC.young_gen.name := "young"
+    GC.young_gen.capacity := ALIGN_UP(young_size, BLOCK_SIZE)
+    GC.young_gen.threshold := GC.young_gen.capacity * 0.9
+    GC.young_gen.target_ratio := 0.3
+    
+    GC.old_gen.name := "old"
+    GC.old_gen.capacity := ALIGN_UP(old_size, BLOCK_SIZE)
+    GC.old_gen.threshold := GC.old_gen.capacity * 0.8
+    GC.old_gen.target_ratio := 0.5
+    
+    # Allocate heap memory
+    total_size := GC.young_gen.capacity + GC.old_gen.capacity
+    heap_base := MMAP_ANONYMOUS(total_size, PROT_READ | PROT_WRITE)
+    IF heap_base == null:
+        ABORT("Failed to allocate heap")
+    END
+    
+    # Set up young generation
+    GC.young_gen.start := heap_base
+    GC.young_gen.end := heap_base + GC.young_gen.capacity
+    GC.young_gen.used := 0
+    CreateBlocksForGeneration(&GC.young_gen)
+    
+    # Set up old generation
+    GC.old_gen.start := GC.young_gen.end
+    GC.old_gen.end := GC.old_gen.start + GC.old_gen.capacity
+    GC.old_gen.used := 0
+    CreateBlocksForGeneration(&GC.old_gen)
+    
+    # Initialize GC state
+    GC.phase := GC_IDLE
+    GC.cycle := 0
+    GC.mark_stack := CREATE_DYNAMIC_ARRAY[ptr[ObjectHeader]](MARK_STACK_SIZE)
+    GC.roots := CREATE_DYNAMIC_ARRAY[ptr[ptr[ObjectHeader]]]()
+    GC.stack_roots := CREATE_DYNAMIC_ARRAY[StackRoot]()
+    GC.remembered_set := CREATE_HASHSET[ptr[ObjectHeader]]()
+    
+    # Card table: one byte per 512 bytes of heap
+    card_table_size := total_size / 512
+    GC.card_table := CALLOC(card_table_size, 1)
+    
+    # Default configuration
+    GC.incremental := false
+    GC.parallel := false
+    GC.num_threads := 1
+    GC.barrier_mode := WB_NONE
+END
+
+FUNCTION CreateBlocksForGeneration(gen: ptr[Generation]):
+    num_blocks := gen.capacity / BLOCK_SIZE
+    gen.num_blocks := num_blocks
+    gen.blocks := null
+    
+    prev_block : ptr[HeapBlock] := null
+    current := gen.start
+    
+    FOR i IN 0..(num_blocks-1):
+        block := MALLOC(sizeof(HeapBlock)) AS ptr[HeapBlock]
+        block.start := current
+        block.end := current + BLOCK_SIZE
+        block.free := current
+        block.compact_dest := current
+        block.live_bytes := 0
+        block.num_objects := 0
+        block.num_pinned := 0
+        block.prev := prev_block
+        block.next := null
+        
+        IF prev_block != null:
+            prev_block.next := block
+        ELSE:
+            gen.blocks := block
+            gen.alloc_block := block
+        END
+        
+        prev_block := block
+        current += BLOCK_SIZE
+    END
+END
+
+######################################
+# SECTION 4 — ALLOCATION
+######################################
+
+FUNCTION Allocate(size: usize, flags: u32 = 0) RETURNS ptr[ObjectHeader]:
+    # Round up to alignment
+    total_size := ALIGN_UP(sizeof(ObjectHeader) + size, WORD_SIZE)
+    
+    # Large object handling
+    IF total_size > BLOCK_SIZE / 4:
+        RETURN AllocateLarge(total_size, flags)
+    END
+    
+    # Choose generation (always young for now)
+    gen := &GC.young_gen
+    
+    # Fast path: try current block
+    block := gen.alloc_block
+    new_free := block.free + total_size
+    
+    IF new_free <= block.end:
+        obj := block.free AS ptr[ObjectHeader]
+        block.free := new_free
+        gen.used += total_size
+        block.num_objects += 1
+        
+        # Initialize object
+        obj.header := (total_size << 16) OR flags
+        obj.klass_or_thread := null
+        
+        # Apply allocation color if GC is active
+        IF GC.phase == GC_MARKING AND gen.alloc_color == 1:
+            SetObjectFlag(obj, MARK_BIT)
+        END
+        
+        GC.total_allocated += total_size
+        
+        # Check collection threshold
+        IF gen.used > gen.threshold:
+            TriggerGC(gen)
+        END
+        
+        RETURN obj
+    END
+    
+    # Slow path: find new block
+    RETURN AllocateSlow(gen, total_size, flags)
+END
+
+FUNCTION AllocateSlow(gen: ptr[Generation], size: usize, flags: u32) RETURNS ptr[ObjectHeader]:
+    # Try next block
+    IF gen.alloc_block.next != null:
+        gen.alloc_block := gen.alloc_block.next
+        RETURN Allocate(size, flags)  # retry
+    END
+    
+    # All blocks full, trigger GC
+    CollectGeneration(gen)
+    
+    # Retry allocation
+    IF gen.used + size <= gen.capacity:
+        # Reset to first block after GC
+        gen.alloc_block := gen.blocks
+        RETURN Allocate(size, flags)
+    END
+    
+    ABORT("Out of memory")
+END
+
+FUNCTION AllocateLarge(size: usize, flags: u32) RETURNS ptr[ObjectHeader]:
+    # Allocate dedicated block for large object
+    total_size := ALIGN_UP(size, BLOCK_SIZE)
+    memory := MMAP_ANONYMOUS(total_size, PROT_READ | PROT_WRITE)
+    IF memory == null:
+        RETURN null
+    END
+    
+    obj := memory AS ptr[ObjectHeader]
+    obj.header := (size << 16) OR flags OR LARGE_BIT
+    obj.klass_or_thread := null
+    
+    # Add to large object list
+    block := MALLOC(sizeof(HeapBlock)) AS ptr[HeapBlock]
+    block.start := memory
+    block.end := memory + total_size
+    block.free := memory + size
+    block.next := GC.large_space
+    GC.large_space := block
+    
+    RETURN obj
+END
+
+######################################
+# SECTION 5 — MARKING PHASE
+######################################
+
+FUNCTION MarkObject(obj: ptr[ObjectHeader]) RETURNS bool:
+    IF obj == null OR IsMarked(obj):
+        RETURN false
+    END
+    
+    SetObjectFlag(obj, MARK_BIT)
+    
+    # Push to mark stack
+    IF NOT GC.mark_stack.Push(obj):
+        GC.mark_overflow := true
+        # Handle overflow with fallback scanning
+    END
+    
+    RETURN true
+END
+
+FUNCTION ScanObject(obj: ptr[ObjectHeader]):
+    # Get object type info to find references
+    IF IsThreaded(obj):
+        RETURN  # Skip during threading phase
+    END
+    
+    klass := obj.klass_or_thread AS ptr[ClassInfo]
+    IF klass == null OR klass.ref_map == null:
+        RETURN  # No references
+    END
+    
+    # Scan reference fields
+    obj_start := (obj + 1) AS ptr[u8]
+    ref_map := klass.ref_map
+    
+    FOR offset IN ref_map:
+        ref_location := (obj_start + offset) AS ptr[ptr[ObjectHeader]]
+        ref := *ref_location
+        IF ref != null:
+            MarkObject(ref)
+        END
+    END
+END
+
+FUNCTION MarkRoots():
+    # Mark from global roots
+    FOR root_ptr IN GC.roots:
+        obj := *root_ptr
+        MarkObject(obj)
+    END
+    
+    # Mark from stack roots
+    FOR stack_root IN GC.stack_roots:
+        obj := *(stack_root.location)
+        MarkObject(obj)
+    END
+    
+    # Mark from remembered set (old→young pointers)
+    IF GC.barrier_mode != WB_NONE:
+        FOR obj IN GC.remembered_set:
+            MarkObject(obj)
+        END
+    END
+END
+
+FUNCTION ProcessMarkStack():
+    WHILE NOT GC.mark_stack.IsEmpty():
+        obj := GC.mark_stack.Pop()
+        ScanObject(obj)
+    END
+    
+    # Handle overflow by scanning heap
+    IF GC.mark_overflow:
+        HandleMarkOverflow()
+        GC.mark_overflow := false
+    END
+END
+
+FUNCTION HandleMarkOverflow():
+    # Scan all marked objects in heap to find unmarked children
+    FOR gen IN {&GC.young_gen, &GC.old_gen}:
+        block := gen.blocks
+        WHILE block != null:
+            current := block.start AS ptr[ObjectHeader]
+            WHILE current < block.free:
+                IF IsMarked(current):
+                    ScanObject(current)
+                END
+                size := GetObjectSize(current)
+                current := ((current AS ptr[u8]) + size) AS ptr[ObjectHeader]
+            END
+            block := block.next
+        END
+    END
+END
+
+FUNCTION MarkPhase():
+    start_time := GET_TIME_MS()
+    
+    GC.phase := GC_MARKING
+    GC.mark_stack.Clear()
+    GC.mark_overflow := false
+    
+    # Clear all mark bits
+    ClearAllMarkBits()
+    
+    # Mark roots
+    MarkRoots()
+    
+    # Process marking
+    IF GC.parallel AND GC.num_threads > 1:
+        ParallelMark()
+    ELSE:
+        ProcessMarkStack()
+    END
+    
+    GC.mark_time_ms := GET_TIME_MS() - start_time
+END
+
+######################################
+# SECTION 6 — THREADING PHASE
+######################################
+
+FUNCTION ThreadObjects(gen: ptr[Generation]):
+    # Jonkers' threading: thread live objects together
+    GC.phase := GC_THREADING
+    
+    block := gen.blocks
+    WHILE block != null:
+        ThreadBlock(block)
+        block := block.next
+    END
+END
+
+FUNCTION ThreadBlock(block: ptr[HeapBlock]):
+    # First pass: thread all live objects in address order
+    prev_live : ptr[ObjectHeader] := null
+    current := block.start AS ptr[ObjectHeader]
+    first_live : ptr[ObjectHeader] := null
+    
+    WHILE (current AS ptr[u8]) < block.free:
+        size := GetObjectSize(current)
+        
+        IF IsMarked(current) AND NOT IsPinned(current):
+            # Save class pointer
+            saved_class := current.klass_or_thread
+            
+            IF prev_live != null:
+                SetThreadNext(prev_live, current)
+            ELSE:
+                first_live := current
+            END
+            
+            prev_live := current
+            
+            # Store saved class in object body temporarily
+            IF size >= sizeof(ptr[void]) * 2:
+                *((current + 1) AS ptr[ptr[void]]) := saved_class
+            END
+        END
+        
+        current := ((current AS ptr[u8]) + size) AS ptr[ObjectHeader]
+    END
+    
+    # Thread last object to null
+    IF prev_live != null:
+        SetThreadNext(prev_live, null)
+    END
+    
+    # Store head of thread list
+    block.compact_dest := first_live AS ptr[u8]
+END
+
+######################################
+# SECTION 7 — COMPACTION PHASE
+######################################
+
+FUNCTION CompactGeneration(gen: ptr[Generation]):
+    GC.phase := GC_COMPACTING
+    
+    # Calculate forwarding addresses
+    ComputeForwardingAddresses(gen)
+    
+    # Update all pointers
+    UpdatePointers(gen)
+    
+    # Move objects
+    MoveObjects(gen)
+    
+    # Reset allocation
+    ResetGeneration(gen)
+END
+
+FUNCTION ComputeForwardingAddresses(gen: ptr[Generation]):
+    # Walk all blocks and assign forwarding addresses
+    dest := gen.start
+    
+    block := gen.blocks
+    WHILE block != null:
+        block.compact_dest := dest
+        current := block.start AS ptr[ObjectHeader]
+        
+        WHILE (current AS ptr[u8]) < block.free:
+            size := GetObjectSize(current)
+            
+            IF IsMarked(current):
+                IF IsPinned(current):
+                    # Pinned objects don't move
+                    SetForwardingAddress(current, current)
+                ELSE:
+                    # Assign new location
+                    SetForwardingAddress(current, dest AS ptr[ObjectHeader])
+                    dest += size
+                END
+            END
+            
+            current := ((current AS ptr[u8]) + size) AS ptr[ObjectHeader]
+        END
+        
+        block := block.next
+    END
+    
+    gen.used := dest - gen.start
+END
+
+FUNCTION UpdatePointers(gen: ptr[Generation]):
+    GC.phase := GC_UPDATING
+    
+    # Update roots
+    UpdateRootPointers()
+    
+    # Update pointers in all live objects
+    block := gen.blocks
+    WHILE block != null:
+        current := block.start AS ptr[ObjectHeader]
+        
+        WHILE (current AS ptr[u8]) < block.free:
+            IF IsMarked(current):
+                UpdateObjectPointers(current)
+            END
+            
+            size := GetObjectSize(current)
+            current := ((current AS ptr[u8]) + size) AS ptr[ObjectHeader]
+        END
+        
+        block := block.next
+    END
+END
+
+FUNCTION UpdateObjectPointers(obj: ptr[ObjectHeader]):
+    # Restore class pointer if threaded
+    IF IsThreaded(obj):
+        saved_class := *((obj + 1) AS ptr[ptr[void]])
+        obj.klass_or_thread := saved_class
+    END
+    
+    klass := obj.klass_or_thread AS ptr[ClassInfo]
+    IF klass == null OR klass.ref_map == null:
+        RETURN
+    END
+    
+    # Update reference fields
+    obj_start := (obj + 1) AS ptr[u8]
+    ref_map := klass.ref_map
+    
+    FOR offset IN ref_map:
+        ref_location := (obj_start + offset) AS ptr[ptr[ObjectHeader]]
+        old_ref := *ref_location
+        IF old_ref != null AND IsForwarded(old_ref):
+            *ref_location := GetForwardingAddress(old_ref)
+        END
+    END
+END
+
+FUNCTION UpdateRootPointers():
+    # Update global roots
+    FOR root_ptr IN GC.roots:
+        obj := *root_ptr
+        IF obj != null AND IsForwarded(obj):
+            *root_ptr := GetForwardingAddress(obj)
+        END
+    END
+    
+    # Update stack roots
+    FOR stack_root IN GC.stack_roots:
+        obj := *(stack_root.location)
+        IF obj != null AND IsForwarded(obj):
+            *(stack_root.location) := GetForwardingAddress(obj)
+        END
+    END
+END
+
+FUNCTION MoveObjects(gen: ptr[Generation]):
+    # Use threading to move objects efficiently
+    block := gen.blocks
+    WHILE block != null:
+        IF block.compact_dest != null:
+            MoveBlockObjects(block)
+        END
+        block := block.next
+    END
+END
+
+FUNCTION MoveBlockObjects(block: ptr[HeapBlock]):
+    # Follow thread list to move objects
+    current := block.compact_dest AS ptr[ObjectHeader]
+    dest := block.start
+    
+    WHILE current != null:
+        size := GetObjectSize(current)
+        next := GetThreadNext(current)
+        
+        IF NOT IsPinned(current):
+            # Move object
+            new_location := GetForwardingAddress(current)
+            IF new_location != current:
+                MEMMOVE(new_location, current, size)
+            END
+        END
+        
+        current := next
+    END
+    
+    # Update block metadata
+    block.free := dest
+    block.compact_dest := null
+END
+
+FUNCTION ResetGeneration(gen: ptr[Generation]):
+    # Clear forwarding bits and prepare for allocation
+    block := gen.blocks
+    first_non_empty : ptr[HeapBlock] := null
+    
+    WHILE block != null:
+        IF block.free > block.start:
+            IF first_non_empty == null:
+                first_non_empty := block
+            END
+            
+            # Clear GC bits from live objects
+            current := block.start AS ptr[ObjectHeader]
+            WHILE (current AS ptr[u8]) < block.free:
+                ClearObjectFlag(current, MARK_BIT OR FORWARDED_BIT)
+                size := GetObjectSize(current)
+                current := ((current AS ptr[u8]) + size) AS ptr[ObjectHeader]
+            END
+        ELSE:
+            # Empty block
+            block.free := block.start
+        END
+        
+        block := block.next
+    END
+    
+    gen.alloc_block := first_non_empty OR gen.blocks
+END
+
+######################################
+# SECTION 8 — COLLECTION CONTROL
+######################################
+
+FUNCTION TriggerGC(gen: ptr[Generation]):
+    IF GC.phase != GC_IDLE:
+        RETURN  # Already collecting
+    END
+    
+    CollectGeneration(gen)
+END
+
+FUNCTION CollectGeneration(gen: ptr[Generation]):
+    start_time := GET_TIME_MS()
+    GC.cycle += 1
+    
+    PRINT("GC[${GC.cycle}]: Starting ${gen.name} collection")
+    
+    # Save roots
+    CaptureRoots()
+    
+    # Mark phase
+    MarkPhase()
+    
+    # Thread phase (prepare for compaction)
+    ThreadObjects(gen)
+    
+    # Compact phase
+    CompactGeneration(gen)
+    
+    # Sweep large objects
+    SweepLargeObjects()
+    
+    # Update statistics
+    total_time := GET_TIME_MS() - start_time
+    reclaimed := gen.used
+    
+    PRINT("GC[${GC.cycle}]: Completed in ${total_time}ms")
+    PRINT("  Marked: ${GC.mark_time_ms}ms")
+    PRINT("  Compacted: ${GC.compact_time_ms}ms")
+    PRINT("  Reclaimed: ${reclaimed} bytes")
+    
+    GC.phase := GC_IDLE
+    GC.total_collected += reclaimed
+END
+
+FUNCTION SweepLargeObjects():
+    prev : ptr[HeapBlock] := null
+    current := GC.large_space
+    
+    WHILE current != null:
+        next := current.next
+        obj := current.start AS ptr[ObjectHeader]
+        
+        IF NOT IsMarked(obj):
+            # Free large object
+            size := GetObjectSize(obj)
+            MUNMAP(current.start, ALIGN_UP(size, BLOCK_SIZE))
+            
+            IF prev != null:
+                prev.next := next
+            ELSE:
+                GC.large_space := next
+            END
+            
+            FREE(current)
+        ELSE:
+            # Clear mark bit
+            ClearObjectFlag(obj, MARK_BIT)
+            prev := current
+        END
+        
+        current := next
+    END
+END
+
+######################################
+# SECTION 9 — WRITE BARRIERS
+######################################
+
+FUNCTION WriteBarrier(location: ptr[ptr[ObjectHeader]], new_value: ptr[ObjectHeader]):
+    old_value := *location
+    *location := new_value
+    
+    IF GC.barrier_mode == WB_NONE:
+        RETURN
+    END
+    
+    # Snapshot barrier for concurrent marking
+    IF GC.barrier_mode == WB_SNAPSHOT:
+        IF GC.phase == GC_MARKING:
+            # Mark old value to preserve it
+            IF old_value != null AND NOT IsMarked(old_value):
+                MarkObject(old_value)
+            END
+        END
+    END
+    
+    # Remember old→young pointers
+    IF new_value != null:
+        IF IsInOldGen(location) AND IsInYoungGen(new_value):
+            RememberObject(location)
+        END
+    END
+END
+
+FUNCTION RememberObject(location: ptr[ptr[ObjectHeader]]):
+    # Add to remembered set
+    obj := ContainingObject(location)
+    IF obj != null:
+        GC.remembered_set.Add(obj)
+        SetObjectFlag(obj, REMEMBERED_BIT)
+        
+        # Also mark card
+        card_index := ((obj AS usize) - (GC.young_gen.start AS usize)) / 512
+        GC.card_table[card_index] := 1
+    END
+END
+
+FUNCTION IsInYoungGen(obj: ptr[ObjectHeader]) RETURNS bool:
+    addr := obj AS ptr[u8]
+    RETURN addr >= GC.young_gen.start AND addr < GC.young_gen.end
+END
+
+FUNCTION IsInOldGen(obj: ptr[ObjectHeader]) RETURNS bool:
+    addr := obj AS ptr[u8]
+    RETURN addr >= GC.old_gen.start AND addr < GC.old_gen.end
+END
+
+FUNCTION ContainingObject(interior: ptr[void]) RETURNS ptr[ObjectHeader]:
+    # Find object containing interior pointer
+    # This requires object map or conservative scanning
+    # Simplified: assume we have object start info
+    RETURN null  # TODO: implement
+END
+
+######################################
+# SECTION 10 — ROOT SCANNING
+######################################
+
+FUNCTION CaptureRoots():
+    GC.roots.Clear()
+    GC.stack_roots.Clear()
+    
+    # Scan global roots
+    ScanGlobalRoots()
+    
+    # Scan thread stacks
+    ScanAllThreads()
+    
+    # Scan handle table if exists
+    ScanHandleTable()
+END
+
+FUNCTION ScanGlobalRoots():
+    # Application must register global root locations
+    # This is typically done at startup
+END
+
+FUNCTION ScanAllThreads():
+    threads := GetAllThreads()
+    FOR thread IN threads:
+        ScanThreadStack(thread)
+        ScanThreadRegisters(thread)
+    END
+END
+
+FUNCTION ScanThreadStack(thread: ptr[Thread]):
+    # Must be at safe point
+    frame := thread.current_frame
+    
+    WHILE frame != null:
+        # Get frame's stack map
+        stack_map := GetStackMap(frame.return_addr)
+        IF stack_map != null:
+            FOR slot IN stack_map.live_slots:
+                location := frame.base + slot.offset
+                IF slot.is_reference:
+                    root : StackRoot
+                    root.location := location AS ptr[ptr[ObjectHeader]]
+                    root.frame := frame
+                    GC.stack_roots.Push(root)
+                END
+            END
+        END
+        
+        frame := frame.caller
+    END
+END
+
+######################################
+# SECTION 11 — HELPERS & UTILITIES  
+######################################
+
+FUNCTION ClearAllMarkBits():
+    # Clear mark bits in all objects
+    FOR gen IN {&GC.young_gen, &GC.old_gen}:
+        block := gen.blocks
+        WHILE block != null:
+            current := block.start AS ptr[ObjectHeader]
+            WHILE (current AS ptr[u8]) < block.free:
+                ClearObjectFlag(current, MARK_BIT)
+                size := GetObjectSize(current)
+                current := ((current AS ptr[u8]) + size) AS ptr[ObjectHeader]
+            END
+            block := block.next
+        END
+    END
+    
+    # Clear large objects
+    block := GC.large_space
+    WHILE block != null:
+        obj := block.start AS ptr[ObjectHeader]
+        ClearObjectFlag(obj, MARK_BIT)
+        block := block.next
+    END
+END
+
+FUNCTION PrintHeapStatistics():
+    PRINT("Heap Statistics:")
+    PRINT("  Young Generation:")
+    PRINT("    Capacity: ${GC.young_gen.capacity}")
+    PRINT("    Used: ${GC.young_gen.used}")
+    PRINT("    Blocks: ${GC.young_gen.num_blocks}")
+    PRINT("  Old Generation:")
+    PRINT("    Capacity: ${GC.old_gen.capacity}")
+    PRINT("    Used: ${GC.old_gen.used}")
+    PRINT("    Blocks: ${GC.old_gen.num_blocks}")
+    PRINT("  Total Allocated: ${GC.total_allocated}")
+    PRINT("  Total Collected: ${GC.total_collected}")
+    PRINT("  GC Cycles: ${GC.cycle}")
+END
+
+FUNCTION VerifyHeap() RETURNS bool:
+    ok := true
+    
+    # Verify all objects are properly formed
+    FOR gen IN {&GC.young_gen, &GC.old_gen}:
+        block := gen.blocks
+        WHILE block != null:
+            current := block.start AS ptr[ObjectHeader]
+            WHILE (current AS ptr[u8]) < block.free:
+                size := GetObjectSize(current)
+                IF size < MIN_OBJECT_SIZE:
+                    PRINT("Invalid object size at ${current}")
+                    ok := false
+                END
+                
+                # Verify object doesn't overlap block boundary
+                IF ((current AS ptr[u8]) + size) > block.end:
+                    PRINT("Object extends beyond block at ${current}")
+                    ok := false
+                END
+                
+                current := ((current AS ptr[u8]) + size) AS ptr[ObjectHeader]
+            END
+            block := block.next
+        END
+    END
+    
+    RETURN ok
+END
+
+# Utility macros:
+FUNCTION ALIGN_UP(value: usize, align: usize) RETURNS usize:
+    RETURN ((value + align - 1) / align) * align
+END
+
+FUNCTION MAX(a: usize, b: usize) RETURNS usize:
+    IF a > b: RETURN a
+    ELSE: RETURN b
+END
+
+FUNCTION GET_TIME_MS() RETURNS u32:
+    RETURN SYSTEM_TIME_MS()
+END
+

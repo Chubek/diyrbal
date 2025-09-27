@@ -1,0 +1,1091 @@
+LANGUAGE = "sudolang"
+
+############################################################
+#  DIYRBAL CONTROL-FLOW GRAPH & ANALYSIS                  #
+#  CFG construction, optimization, and trace extraction    #
+############################################################
+
+########################################
+# SECTION 0 — CONSTANTS & TYPES
+########################################
+
+# Basic block flags
+CONST BB_ENTRY        = 0x01    # Entry block of function
+CONST BB_EXIT         = 0x02    # Exit block of function
+CONST BB_LOOP_HEADER  = 0x04    # Loop entry point
+CONST BB_LOOP_EXIT    = 0x08    # Loop exit point
+CONST BB_TRACE_HEAD   = 0x10    # Start of hot trace
+CONST BB_MERGE_POINT  = 0x20    # Phi node location
+
+# Edge types
+CONST EDGE_FALLTHROUGH = 0      # Sequential execution
+CONST EDGE_BRANCH_TRUE = 1      # Conditional branch taken
+CONST EDGE_BRANCH_FALSE = 2     # Conditional branch not taken
+CONST EDGE_JUMP        = 3      # Unconditional jump
+CONST EDGE_CALL        = 4      # Function call
+CONST EDGE_RETURN      = 5      # Function return
+CONST EDGE_EXCEPTION   = 6      # Exception edge
+CONST EDGE_LOOP_BACK   = 7      # Back edge in loop
+
+# Trace recording states
+CONST TRACE_OFF       = 0       # Not recording
+CONST TRACE_MONITOR   = 1       # Monitoring for hot loops
+CONST TRACE_RECORDING = 2       # Recording trace
+CONST TRACE_COMPILED  = 3       # Trace compiled and ready
+
+# Guard types for traces
+CONST GUARD_TYPE      = 0x01    # Type check
+CONST GUARD_SHAPE     = 0x02    # Object shape check
+CONST GUARD_OVERFLOW  = 0x04    # Integer overflow check
+CONST GUARD_BOUNDS    = 0x08    # Array bounds check
+CONST GUARD_BRANCH    = 0x10    # Branch direction check
+CONST GUARD_CLASS     = 0x20    # Class/metaclass check
+
+# Optimization levels
+CONST OPT_NONE        = 0
+CONST OPT_BASIC       = 1       # Basic optimizations
+CONST OPT_FULL        = 2       # Full optimizations
+
+########################################
+# SECTION 1 — BASIC STRUCTURES
+########################################
+
+STRUCT BasicBlock:
+    id          : u32               # Unique block ID
+    start_pc    : u32               # First instruction
+    end_pc      : u32               # Last instruction
+    
+    # CFG connections
+    predecessors : List<Edge*>      # Incoming edges
+    successors   : List<Edge*>      # Outgoing edges
+    
+    # Properties
+    flags       : u32               # Block flags
+    loop_depth  : u32               # Nesting level
+    exec_count  : u64               # Execution counter
+    
+    # Dominance information
+    idom        : BasicBlock*       # Immediate dominator
+    dom_children: List<BasicBlock*> # Dominated blocks
+    
+    # SSA information
+    phi_nodes   : List<PhiNode>    # Phi nodes at entry
+    live_in     : BitSet            # Live variables at entry
+    live_out    : BitSet            # Live variables at exit
+    
+    # Trace information
+    trace_id    : u32               # Associated trace (-1 if none)
+    side_exits  : List<SideExit*>  # Exit points from trace
+END
+
+STRUCT Edge:
+    type        : u8                # Edge type
+    source      : BasicBlock*       # Source block
+    target      : BasicBlock*       # Target block
+    probability : f32               # Branch probability
+    
+    # Guards for conditional edges
+    guard       : Guard*            # Associated guard
+END
+
+STRUCT PhiNode:
+    dest_reg    : u8                # Destination register
+    sources     : List<PhiSource>   # Source values
+END
+
+STRUCT PhiSource:
+    block       : BasicBlock*       # Source block
+    reg         : u8                # Source register
+    value       : Value             # Constant value (if known)
+END
+
+########################################
+# SECTION 2 — CONTROL FLOW GRAPH
+########################################
+
+STRUCT ControlFlowGraph:
+    function    : Proto*            # Function prototype
+    blocks      : List<BasicBlock*> # All basic blocks
+    entry_block : BasicBlock*       # Entry point
+    exit_blocks : List<BasicBlock*> # Exit points
+    
+    # Analysis results
+    loops       : List<Loop*>       # Detected loops
+    dom_tree    : DominatorTree*    # Dominator tree
+    
+    # Optimization metadata
+    opt_level   : u8                # Applied optimization level
+    modified    : bool              # Changed since last analysis
+END
+
+STRUCT Loop:
+    header      : BasicBlock*       # Loop header block
+    blocks      : Set<BasicBlock*>  # All blocks in loop
+    back_edges  : List<Edge*>       # Back edges
+    exits       : List<Edge*>       # Exit edges
+    
+    parent      : Loop*             # Parent loop (if nested)
+    children    : List<Loop*>       # Nested loops
+    depth       : u32               # Nesting depth
+    
+    # Profile information
+    iterations  : u64               # Total iterations
+    hot_count   : u32               # Times marked as hot
+END
+
+########################################
+# SECTION 3 — CFG CONSTRUCTION
+########################################
+
+FUNCTION BUILD_CFG(proto: Proto*) RETURNS ControlFlowGraph*:
+    cfg := ALLOC(ControlFlowGraph)
+    cfg->function := proto
+    cfg->blocks := List<BasicBlock*>()
+    
+    # First pass: identify basic block boundaries
+    leaders := FIND_BLOCK_LEADERS(proto)
+    
+    # Create basic blocks
+    FOR i := 0 TO leaders.size - 1:
+        block := ALLOC(BasicBlock)
+        block->id := i
+        block->start_pc := leaders[i]
+        
+        IF i < leaders.size - 1:
+            block->end_pc := leaders[i + 1] - 1
+        ELSE:
+            block->end_pc := proto->code_size - 1
+        END
+        
+        LIST_APPEND(cfg->blocks, block)
+    END
+    
+    # Second pass: create edges
+    FOR block IN cfg->blocks:
+        ANALYZE_BLOCK_EXITS(proto, block, cfg)
+    END
+    
+    # Set entry and exit blocks
+    cfg->entry_block := cfg->blocks[0]
+    cfg->entry_block->flags |= BB_ENTRY
+    
+    # Find exit blocks (no successors or only exception edges)
+    FOR block IN cfg->blocks:
+        IF IS_EXIT_BLOCK(block):
+            block->flags |= BB_EXIT
+            LIST_APPEND(cfg->exit_blocks, block)
+        END
+    END
+    
+    # Perform initial analyses
+    COMPUTE_DOMINATORS(cfg)
+    DETECT_LOOPS(cfg)
+    
+    RETURN cfg
+END
+
+FUNCTION FIND_BLOCK_LEADERS(proto: Proto*) RETURNS List<u32>:
+    leaders := Set<u32>()
+    SET_ADD(leaders, 0)  # First instruction is always a leader
+    
+    pc := 0 AS u32
+    WHILE pc < proto->code_size:
+        instr := proto->code[pc]
+        opcode := GET_OPCODE(instr)
+        
+        CASE opcode OF:
+            # Branches create new blocks
+            OP_JMP, OP_JMPIF, OP_JMPNIF:
+                target := pc + GET_IMM16_SIGNED(instr)
+                SET_ADD(leaders, target)
+                SET_ADD(leaders, pc + 1)
+                
+            # Calls might not return
+            OP_CALL:
+                SET_ADD(leaders, pc + 1)
+                
+            # Returns end current block
+            OP_RETURN:
+                IF pc + 1 < proto->code_size:
+                    SET_ADD(leaders, pc + 1)
+                END
+                
+            # Exception handlers
+            OP_TRY:
+                handler_pc := pc + GET_IMM16(instr)
+                SET_ADD(leaders, handler_pc)
+                
+            # Loop headers (marked by backward jumps)
+            DEFAULT:
+                IF IS_LOOP_INSTRUCTION(instr):
+                    SET_ADD(leaders, pc)
+                END
+        END
+        
+        pc++
+    END
+    
+    # Convert set to sorted list
+    RETURN SORT_LIST(SET_TO_LIST(leaders))
+END
+
+PROCEDURE ANALYZE_BLOCK_EXITS(proto: Proto*, block: BasicBlock*, cfg: ControlFlowGraph*):
+    last_pc := block->end_pc
+    last_instr := proto->code[last_pc]
+    opcode := GET_OPCODE(last_instr)
+    
+    CASE opcode OF:
+        OP_JMP:
+            # Unconditional jump
+            target_pc := last_pc + GET_IMM16_SIGNED(last_instr)
+            target := FIND_BLOCK_AT_PC(cfg, target_pc)
+            ADD_EDGE(block, target, EDGE_JUMP)
+            
+        OP_JMPIF, OP_JMPNIF:
+            # Conditional branch
+            target_pc := last_pc + GET_IMM16_SIGNED(last_instr)
+            target := FIND_BLOCK_AT_PC(cfg, target_pc)
+            fallthrough := FIND_BLOCK_AT_PC(cfg, last_pc + 1)
+            
+            IF opcode == OP_JMPIF:
+                ADD_EDGE(block, target, EDGE_BRANCH_TRUE)
+                ADD_EDGE(block, fallthrough, EDGE_BRANCH_FALSE)
+            ELSE:
+                ADD_EDGE(block, target, EDGE_BRANCH_FALSE)
+                ADD_EDGE(block, fallthrough, EDGE_BRANCH_TRUE)
+            END
+            
+        OP_RETURN:
+            # No successors for return
+            PASS
+            
+        DEFAULT:
+            # Fallthrough to next block
+            IF last_pc + 1 < proto->code_size:
+                next_block := FIND_BLOCK_AT_PC(cfg, last_pc + 1)
+                IF next_block != nil:
+                    ADD_EDGE(block, next_block, EDGE_FALLTHROUGH)
+                END
+            END
+    END
+END
+
+FUNCTION ADD_EDGE(source: BasicBlock*, target: BasicBlock*, type: u8) RETURNS Edge*:
+    edge := ALLOC(Edge)
+    edge->type := type
+    edge->source := source
+    edge->target := target
+    edge->probability := 0.5  # Default, will be updated by profiling
+    
+    LIST_APPEND(source->successors, edge)
+    LIST_APPEND(target->predecessors, edge)
+    
+    RETURN edge
+END
+
+########################################
+# SECTION 4 — DOMINANCE ANALYSIS
+########################################
+
+STRUCT DominatorTree:
+    blocks      : List<BasicBlock*> # All blocks
+    idom        : Map<BasicBlock*, BasicBlock*> # Immediate dominators
+    dom_frontier: Map<BasicBlock*, Set<BasicBlock*>> # Dominance frontiers
+END
+
+FUNCTION COMPUTE_DOMINATORS(cfg: ControlFlowGraph*):
+    # Lengauer-Tarjan algorithm for computing dominators
+    n := cfg->blocks.size
+    
+    # Initialize
+    FOR block IN cfg->blocks:
+        block->idom := nil
+    END
+    cfg->entry_block->idom := cfg->entry_block
+    
+    changed := true
+    WHILE changed:
+        changed := false
+        
+        FOR block IN cfg->blocks:
+            IF block == cfg->entry_block:
+                CONTINUE
+            END
+            
+            # Find first processed predecessor
+            new_idom := nil AS BasicBlock*
+            FOR edge IN block->predecessors:
+                pred := edge->source
+                IF pred->idom != nil:
+                    new_idom := pred
+                    BREAK
+                END
+            END
+            
+            # Intersect all other predecessors
+            FOR edge IN block->predecessors:
+                pred := edge->source
+                IF pred != new_idom AND pred->idom != nil:
+                    new_idom := INTERSECT(pred, new_idom)
+                END
+            END
+            
+            IF new_idom != block->idom:
+                block->idom := new_idom
+                changed := true
+            END
+        END
+    END
+    
+    # Build dominator tree
+    FOR block IN cfg->blocks:
+        IF block->idom != nil AND block->idom != block:
+            LIST_APPEND(block->idom->dom_children, block)
+        END
+    END
+    
+    # Compute dominance frontiers
+    COMPUTE_DOM_FRONTIERS(cfg)
+END
+
+FUNCTION INTERSECT(b1: BasicBlock*, b2: BasicBlock*) RETURNS BasicBlock*:
+    finger1 := b1
+    finger2 := b2
+    
+    WHILE finger1 != finger2:
+        WHILE finger1->id < finger2->id:
+            finger1 := finger1->idom
+        END
+        WHILE finger2->id < finger1->id:
+            finger2 := finger2->idom
+        END
+    END
+    
+    RETURN finger1
+END
+
+########################################
+# SECTION 5 — LOOP DETECTION
+########################################
+
+FUNCTION DETECT_LOOPS(cfg: ControlFlowGraph*):
+    cfg->loops := List<Loop*>()
+    
+    # Find back edges using dominance
+    back_edges := List<Edge*>()
+    FOR block IN cfg->blocks:
+        FOR edge IN block->successors:
+            IF DOMINATES(edge->target, edge->source):
+                # Back edge found
+                LIST_APPEND(back_edges, edge)
+            END
+        END
+    END
+    
+    # Build natural loops from back edges
+    FOR edge IN back_edges:
+        loop := BUILD_NATURAL_LOOP(edge)
+        
+        # Check if this extends an existing loop
+        merged := false
+        FOR existing IN cfg->loops:
+            IF existing->header == loop->header:
+                # Merge loops with same header
+                SET_UNION(existing->blocks, loop->blocks)
+                LIST_APPEND(existing->back_edges, edge)
+                merged := true
+                BREAK
+            END
+        END
+        
+        IF NOT merged:
+            LIST_APPEND(cfg->loops, loop)
+        END
+    END
+    
+    # Establish loop hierarchy
+    BUILD_LOOP_HIERARCHY(cfg->loops)
+    
+    # Mark loop headers and set depths
+    FOR loop IN cfg->loops:
+        loop->header->flags |= BB_LOOP_HEADER
+        
+        FOR block IN loop->blocks:
+            block->loop_depth := MAX(block->loop_depth, loop->depth)
+        END
+    END
+END
+
+FUNCTION BUILD_NATURAL_LOOP(back_edge: Edge*) RETURNS Loop*:
+    loop := ALLOC(Loop)
+    loop->header := back_edge->target
+    loop->blocks := Set<BasicBlock*>()
+    loop->back_edges := List<Edge*>()
+    
+    # Add header
+    SET_ADD(loop->blocks, loop->header)
+    LIST_APPEND(loop->back_edges, back_edge)
+    
+    # Add all blocks that can reach the back edge source
+    # without going through the header (natural loop)
+    worklist := Stack<BasicBlock*>()
+    STACK_PUSH(worklist, back_edge->source)
+    SET_ADD(loop->blocks, back_edge->source)
+    
+    WHILE NOT STACK_EMPTY(worklist):
+        block := STACK_POP(worklist)
+        
+        FOR edge IN block->predecessors:
+            pred := edge->source
+            IF NOT SET_CONTAINS(loop->blocks, pred):
+                SET_ADD(loop->blocks, pred)
+                IF pred != loop->header:
+                    STACK_PUSH(worklist, pred)
+                END
+            END
+        END
+    END
+    
+    # Find exit edges
+    loop->exits := List<Edge*>()
+    FOR block IN loop->blocks:
+        FOR edge IN block->successors:
+            IF NOT SET_CONTAINS(loop->blocks, edge->target):
+                LIST_APPEND(loop->exits, edge)
+            END
+        END
+    END
+    
+    RETURN loop
+END
+
+########################################
+# SECTION 6 — TRACE RECORDING
+########################################
+
+STRUCT Trace:
+    id          : u32               # Unique trace ID
+    start_block : BasicBlock*       # Entry block
+    blocks      : List<BasicBlock*> # Blocks in trace
+    
+    # Recorded path
+    path        : List<TraceOp>     # Linear operation sequence
+    guards      : List<Guard>       # Guards along the path
+    
+    # Exit information
+    loop_edge   : Edge*             # Loop back edge (if loop trace)
+    side_exits  : List<SideExit>   # Possible exit points
+    
+    # Compilation state
+    state       : u8                # Recording/compiled state
+    exec_count  : u64               # Execution count
+    compiled_code: MachineCode*     # JIT compiled code
+END
+
+STRUCT TraceOp:
+    pc          : u32               # Original PC
+    opcode      : u8                # Operation
+    operands    : ARRAY<u8, 3>     # Operand registers
+    
+    # Type specialization
+    types       : ARRAY<TypeInfo, 3> # Operand types
+    
+    # Optimization hints
+    const_prop  : Value             # Constant value if known
+    invariant   : bool              # Loop invariant
+END
+
+STRUCT Guard:
+    type        : u8                # Guard type
+    pc          : u32               # Location in trace
+    
+    # Guard specifics
+    condition   : GuardCondition    # What to check
+    
+    # Failure handling
+    side_exit   : SideExit*         # Where to go on failure
+    fail_count  : u32               # Times guard failed
+END
+
+STRUCT GuardCondition:
+    UNION:
+        type_check: STRUCT:
+            reg     : u8            # Register to check
+            expected: u8            # Expected type tag
+        END
+        
+        branch_check: STRUCT:
+            reg     : u8            # Condition register
+            expected: bool          # Expected direction
+        END
+        
+        class_check: STRUCT:
+            reg     : u8            # Object register
+            class   : Class*        # Expected class
+        END
+        
+        overflow_check: STRUCT:
+            result  : u8            # Result register
+            op1     : u8            # First operand
+            op2     : u8            # Second operand
+        END
+    END
+END
+
+STRUCT SideExit:
+    pc          : u32               # Exit location
+    target      : BasicBlock*       # Target block
+    
+    # State restoration
+    reg_map     : Map<u8, u8>       # Trace reg -> VM reg
+    stack_depth : u32               # Stack state
+    
+    # Statistics
+    taken_count : u32               # Times this exit taken
+END
+
+########################################
+# SECTION 7 — TRACE SELECTION
+########################################
+
+STRUCT TraceRecorder:
+    cfg         : ControlFlowGraph* # Current CFG
+    current     : Trace*            # Recording trace
+    
+    # Recording state
+    start_pc    : u32               # Where trace started
+    current_block: BasicBlock*      # Current position
+    
+    # Type tracking
+    reg_types   : Map<u8, TypeInfo> # Known register types
+    
+    # Guard generation
+    pending_guards: List<Guard>      # Guards to emit
+END
+
+FUNCTION START_TRACE(recorder: TraceRecorder*, cfg: ControlFlowGraph*, pc: u32):
+    recorder->cfg := cfg
+    recorder->start_pc := pc
+    
+    # Create new trace
+    trace := ALLOC(Trace)
+    trace->id := NEXT_TRACE_ID()
+    trace->state := TRACE_RECORDING
+    trace->path := List<TraceOp>()
+    trace->guards := List<Guard>()
+    
+    block := FIND_BLOCK_AT_PC(cfg, pc)
+    trace->start_block := block
+    recorder->current_block := block
+    
+    recorder->current := trace
+    
+    # Initialize type tracking from current VM state
+    INIT_TYPE_TRACKING(recorder)
+END
+
+FUNCTION RECORD_INSTRUCTION(recorder: TraceRecorder*, instr: u32, regs: RegisterFile):
+    IF recorder->current == nil OR recorder->current->state != TRACE_RECORDING:
+        RETURN
+    END
+    
+    # Create trace operation
+    op := TraceOp{
+        pc: recorder->current_block->start_pc + CURRENT_OFFSET(),
+        opcode: GET_OPCODE(instr),
+        operands: [GET_DEST(instr), GET_SRC1(instr), GET_SRC2(instr)]
+    }
+    
+    # Record operand types
+    FOR i := 0 TO 2:
+        reg := op.operands[i]
+        IF reg < regs.size:
+            op.types[i] := GET_TYPE_INFO(regs.values[reg])
+            recorder->reg_types[reg] := op.types[i]
+        END
+    END
+    
+    # Check if we need guards
+    CASE op.opcode OF:
+        OP_ADD, OP_SUB, OP_MUL:
+            # Add overflow guard for integer operations
+            IF op.types[1].tag == TYPE_INT48 AND op.types[2].tag == TYPE_INT48:
+                guard := Guard{
+                    type: GUARD_OVERFLOW,
+                    pc: op.pc,
+                    condition: GuardCondition{
+                        overflow_check: {
+                            result: op.operands[0],
+                            op1: op.operands[1],
+                            op2: op.operands[2]
+                        }
+                    }
+                }
+                LIST_APPEND(recorder->current->guards, guard)
+            END
+            
+        OP_GETATTR, OP_SETATTR:
+            # Add class guard for object operations
+            IF op.types[1].tag == TYPE_POINTER:
+                class := GET_CLASS(regs.values[op.operands[1]])
+                guard := Guard{
+                    type: GUARD_CLASS,
+                    pc: op.pc,
+                    condition: GuardCondition{
+                        class_check: {
+                            reg: op.operands[1],
+                            class: class
+                        }
+                    }
+                }
+                LIST_APPEND(recorder->current->guards, guard)
+            END
+            
+        OP_JMPIF, OP_JMPNIF:
+            # Record branch direction
+            taken := IS_TRUTHY(regs.values[op.operands[1]])
+            expected := (op.opcode == OP_JMPIF) ? taken : NOT taken
+            
+            guard := Guard{
+                type: GUARD_BRANCH,
+                pc: op.pc,
+                condition: GuardCondition{
+                    branch_check: {
+                        reg: op.operands[1],
+                        expected: expected
+                    }
+                }
+            }
+            LIST_APPEND(recorder->current->guards, guard)
+    END
+    
+    # Add to trace
+    LIST_APPEND(recorder->current->path, op)
+    
+    # Check for trace completion
+    IF SHOULD_END_TRACE(recorder, op):
+        COMPLETE_TRACE(recorder)
+    END
+END
+
+FUNCTION SHOULD_END_TRACE(recorder: TraceRecorder*, op: TraceOp) RETURNS bool:
+    # End trace at loop header (complete loop)
+    IF recorder->current_block == recorder->current->start_block AND
+       op.pc > recorder->start_pc:
+        RETURN true
+    END
+    
+    # End trace at function return
+    IF op.opcode == OP_RETURN:
+        RETURN true
+    END
+    
+    # End trace if too long
+    IF recorder->current->path.size > MAX_TRACE_LENGTH:
+        RETURN true
+    END
+    
+    # End trace at recursive call
+    IF op.opcode == OP_CALL AND IS_RECURSIVE_CALL(op):
+        RETURN true
+    END
+    
+    RETURN false
+END
+
+########################################
+# SECTION 8 — CONTROL FLOW OPTIMIZATION
+########################################
+
+FUNCTION OPTIMIZE_CFG(cfg: ControlFlowGraph*, level: u8):
+    IF level == OPT_NONE:
+        RETURN
+    END
+    
+    cfg->opt_level := level
+    changed := true
+    
+    WHILE changed:
+        changed := false
+        
+        # Basic optimizations
+        changed |= REMOVE_UNREACHABLE_BLOCKS(cfg)
+        changed |= MERGE_BLOCKS(cfg)
+        changed |= REMOVE_EMPTY_BLOCKS(cfg)
+        
+        IF level >= OPT_FULL:
+            # Advanced optimizations
+            changed |= ELIMINATE_REDUNDANT_GUARDS(cfg)
+            changed |= HOIST_LOOP_INVARIANTS(cfg)
+            changed |= UNROLL_SMALL_LOOPS(cfg)
+            changed |= TAIL_DUPLICATE_BLOCKS(cfg)
+        END
+        
+        IF changed:
+            # Recompute analysis after changes
+            COMPUTE_DOMINATORS(cfg)
+            DETECT_LOOPS(cfg)
+        END
+    END
+END
+
+FUNCTION REMOVE_UNREACHABLE_BLOCKS(cfg: ControlFlowGraph*) RETURNS bool:
+    # Mark reachable blocks via DFS
+    reachable := Set<BasicBlock*>()
+    worklist := Stack<BasicBlock*>()
+    
+    STACK_PUSH(worklist, cfg->entry_block)
+    SET_ADD(reachable, cfg->entry_block)
+    
+    WHILE NOT STACK_EMPTY(worklist):
+        block := STACK_POP(worklist)
+        
+        FOR edge IN block->successors:
+            IF NOT SET_CONTAINS(reachable, edge->target):
+                SET_ADD(reachable, edge->target)
+                STACK_PUSH(worklist, edge->target)
+            END
+        END
+    END
+    
+    # Remove unreachable blocks
+    removed := false
+    new_blocks := List<BasicBlock*>()
+    
+    FOR block IN cfg->blocks:
+        IF SET_CONTAINS(reachable, block):
+            LIST_APPEND(new_blocks, block)
+        ELSE:
+            REMOVE_BLOCK(cfg, block)
+            removed := true
+        END
+    END
+    
+    cfg->blocks := new_blocks
+    RETURN removed
+END
+
+FUNCTION MERGE_BLOCKS(cfg: ControlFlowGraph*) RETURNS bool:
+    merged := false
+    
+    FOR block IN cfg->blocks:
+        # Can merge if:
+        # 1. Block has single successor
+        # 2. Successor has single predecessor
+        # 3. No phi nodes in successor
+        
+        IF block->successors.size != 1:
+            CONTINUE
+        END
+        
+        edge := block->successors[0]
+        IF edge->type != EDGE_FALLTHROUGH:
+            CONTINUE
+        END
+        
+        successor := edge->target
+        IF successor->predecessors.size != 1:
+            CONTINUE
+        END
+        
+        IF successor->phi_nodes.size > 0:
+            CONTINUE
+        END
+        
+        # Merge successor into block
+        block->end_pc := successor->end_pc
+        block->successors := successor->successors
+        
+        # Update successor edges
+        FOR succ_edge IN successor->successors:
+            succ_edge->source := block
+        END
+        
+        # Remove successor
+        REMOVE_BLOCK(cfg, successor)
+        merged := true
+    END
+    
+    RETURN merged
+END
+
+FUNCTION ELIMINATE_REDUNDANT_GUARDS(cfg: ControlFlowGraph*) RETURNS bool:
+    # Use dominance to find redundant guards
+    eliminated := false
+    
+    FOR block IN cfg->blocks:
+        guard_info := COLLECT_BLOCK_GUARDS(block)
+        
+        # Check each guard against dominators
+        FOR guard IN guard_info:
+            dom := block->idom
+            
+            WHILE dom != nil AND dom != cfg->entry_block:
+                dom_guards := COLLECT_BLOCK_GUARDS(dom)
+                
+                FOR dom_guard IN dom_guards:
+                    IF GUARDS_EQUIVALENT(guard, dom_guard):
+                        # Guard is redundant
+                        REMOVE_GUARD(block, guard)
+                        eliminated := true
+                        BREAK
+                    END
+                END
+                
+                dom := dom->idom
+            END
+        END
+    END
+    
+    RETURN eliminated
+END
+
+########################################
+# SECTION 9 — TRACE OPTIMIZATION
+########################################
+
+FUNCTION OPTIMIZE_TRACE(trace: Trace*):
+    # Type specialization already recorded
+    # Now apply trace-specific optimizations
+    
+    # 1. Constant propagation within trace
+    const_values := Map<u8, Value>()
+    
+    FOR i, op IN ENUMERATE(trace->path):
+        CASE op.opcode OF:
+            OP_LOADK:
+                # Track constant
+                const_values[op.operands[0]] := GET_CONSTANT_VALUE(op)
+                op.const_prop := const_values[op.operands[0]]
+                
+            OP_ADD, OP_SUB, OP_MUL, OP_DIV:
+                # Check if both operands are constant
+                IF MAP_HAS(const_values, op.operands[1]) AND 
+                   MAP_HAS(const_values, op.operands[2]):
+                    # Fold constant
+                    result := FOLD_CONSTANT_OP(
+                        op.opcode,
+                        const_values[op.operands[1]],
+                        const_values[op.operands[2]]
+                    )
+                    const_values[op.operands[0]] := result
+                    op.const_prop := result
+                END
+        END
+    END
+    
+    # 2. Loop invariant detection
+    IF trace->loop_edge != nil:
+        loop_header_pc := trace->start_block->start_pc
+        
+        FOR op IN trace->path:
+            IF IS_PURE_OPERATION(op.opcode):
+                # Check if operands are loop invariant
+                invariant := true
+                FOR i := 1 TO 2:
+                    reg := op.operands[i]
+                    IF IS_MODIFIED_IN_LOOP(trace, reg, loop_header_pc):
+                        invariant := false
+                        BREAK
+                    END
+                END
+                op.invariant := invariant
+            END
+        END
+    END
+    
+    # 3. Guard strengthening
+    FOR guard IN trace->guards:
+        # If we've seen this guard fail frequently, strengthen it
+        IF guard->fail_count > GUARD_FAIL_THRESHOLD:
+            STRENGTHEN_GUARD(guard, trace)
+        END
+    END
+END
+
+FUNCTION STRENGTHEN_GUARD(guard: Guard*, trace: Trace*):
+    CASE guard->type OF:
+        GUARD_TYPE:
+            # Polymorphic inline cache
+            # Record multiple valid types
+            EXTEND_TYPE_GUARD(guard)
+            
+        GUARD_CLASS:
+            # Handle class hierarchy
+            # Allow subclasses if safe
+            EXTEND_CLASS_GUARD(guard)
+            
+        GUARD_BRANCH:
+            # Create trace tree
+            # Record alternative path
+            CREATE_BRANCH_TRACE(trace, guard)
+    END
+END
+
+########################################
+# SECTION 10 — TRACE TREES
+########################################
+
+STRUCT TraceTree:
+    root        : Trace*            # Primary trace
+    branches    : Map<u32, Trace*>  # PC -> branch trace
+    
+    # Statistics
+    total_exits : u64               # Total side exits taken
+    compilations: u32               # Times recompiled
+END
+
+FUNCTION BUILD_TRACE_TREE(root_trace: Trace*) RETURNS TraceTree*:
+    tree := ALLOC(TraceTree)
+    tree->root := root_trace
+    tree->branches := Map<u32, Trace*>()
+    
+    # Monitor side exits
+    FOR exit IN root_trace->side_exits:
+        IF exit.taken_count > BRANCH_TRACE_THRESHOLD:
+            # Start recording branch trace
+            branch := RECORD_BRANCH_TRACE(root_trace, exit)
+            tree->branches[exit.pc] := branch
+        END
+    END
+    
+    RETURN tree
+END
+
+FUNCTION RECORD_BRANCH_TRACE(parent: Trace*, exit: SideExit*) RETURNS Trace*:
+    # Create trace starting from side exit
+    branch := ALLOC(Trace)
+    branch->id := NEXT_TRACE_ID()
+    branch->start_block := exit.target
+    
+    # Record until rejoin or new loop
+    # This creates the "tree" structure
+    recorder := TraceRecorder{
+        cfg: parent->cfg,
+        current: branch,
+        start_pc: exit.pc
+    }
+    
+    # Continue recording from exit point
+    START_TRACE(&recorder, parent->cfg, exit.pc)
+    
+    RETURN branch
+END
+
+########################################
+# SECTION 11 — CFG QUERIES & UTILITIES
+########################################
+
+FUNCTION POST_DOMINATES(block: BasicBlock*, potential: BasicBlock*) RETURNS bool:
+    # Check if 'block' post-dominates 'potential'
+    # (all paths from potential lead through block)
+    
+    visited := Set<BasicBlock*>()
+    RETURN ALL_PATHS_THROUGH(potential, block, visited)
+END
+
+FUNCTION ALL_PATHS_THROUGH(from: BasicBlock*, through: BasicBlock*, 
+                          visited: Set<BasicBlock*>) RETURNS bool:
+    IF from == through:
+        RETURN true
+    END
+    
+    IF SET_CONTAINS(visited, from):
+        RETURN true  # Assume cycle leads through
+    END
+    
+    SET_ADD(visited, from)
+    
+    IF from->successors.empty():
+        RETURN false  # Exit without going through
+    END
+    
+    FOR edge IN from->successors:
+        IF NOT ALL_PATHS_THROUGH(edge->target, through, visited):
+            RETURN false
+        END
+    END
+    
+    RETURN true
+END
+
+FUNCTION FIND_RECONVERGENCE_POINT(cfg: ControlFlowGraph*, branch: BasicBlock*) 
+    RETURNS BasicBlock*:
+    # Find earliest post-dominator of branch targets
+    
+    IF branch->successors.size < 2:
+        RETURN nil
+    END
+    
+    # Get all branch targets
+    targets := List<BasicBlock*>()
+    FOR edge IN branch->successors:
+        LIST_APPEND(targets, edge->target)
+    END
+    
+    # Find common post-dominator
+    common := targets[0]
+    FOR i := 1 TO targets.size - 1:
+        common := FIND_COMMON_POSTDOM(common, targets[i], cfg)
+        IF common == nil:
+            RETURN nil
+        END
+    END
+    
+    RETURN common
+END
+
+########################################
+# SECTION 12 — SSA SUPPORT
+########################################
+
+PROCEDURE CONVERT_TO_SSA(cfg: ControlFlowGraph*):
+    # Place phi functions at dominance frontiers
+    FOR var IN FIND_ALL_VARIABLES(cfg):
+        defs := FIND_DEFINITIONS(cfg, var)
+        
+        worklist := Set<BasicBlock*>()
+        FOR def_block IN defs:
+            LIST_APPEND(worklist, def_block)
+        END
+        
+        WHILE NOT worklist.empty():
+            block := SET_POP(worklist)
+            
+            FOR df_block IN GET_DOM_FRONTIER(block):
+                IF NOT HAS_PHI_FOR_VAR(df_block, var):
+                    INSERT_PHI(df_block, var)
+                    
+                    # Phi is also a definition
+                    IF NOT SET_CONTAINS(defs, df_block):
+                        SET_ADD(defs, df_block)
+                        SET_ADD(worklist, df_block)
+                    END
+                END
+            END
+        END
+    END
+    
+    # Rename variables to SSA form
+    RENAME_VARIABLES(cfg)
+END
+
+########################################
+# APPENDIX — INTEGRATION NOTES
+########################################
+
+# • CFG integrates with VM for:
+#   - Basic block boundaries in Proto
+#   - Profile-guided optimization
+#   - Trace recording triggers
+#
+# • Trace compilation will:
+#   - Use type information from traces
+#   - Generate specialized machine code
+#   - Install guards for assumptions
+#
+# • Optimizations inspired by:
+#   - Control flow simplification paper
+#   - Reconvergence prediction
+#   - TraceMonkey's nested trace trees
+
