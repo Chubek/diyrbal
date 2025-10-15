@@ -12,11 +12,12 @@
 #include "concurr.h"
 #include "function.h"
 #include "peg.h"
+#include "proto.h"
 #include "value.h"
 
 typedef uint32_t diy_symbol_t;
 typedef struct DIY_String diy_string_t;
-typedef struct DIY_ByteBuffer diy_bytebuffer_t;
+typedef struct DIY_ByteBuffer diy_bytebuff_t;
 typedef struct DIY_Tuple diy_tuple_t;
 typedef struct DIY_Array diy_array_t;
 typedef struct DIY_Map diy_map_t;
@@ -37,37 +38,41 @@ typedef enum ChannelState CHANNEL_STATE;
 
 struct DIY_String
 {
-  DIY_GC_HEADER;
-  char32_t *buffer;
+  DIY_GC_HEADER ("String");
+  char32_t *buff;
   size_t len, cap;
+  diy_objproto_t *proto;
 };
 
 struct DIY_ByteBuffer
 {
-  DIY_GC_HEADER;
-  uint8_t *buffer;
+  DIY_GC_HEADER ("ByteBuffer");
+  uint8_t *buff;
   size_t len, cap;
   bool is_readonly;
+  diy_objproto_t *proto;
 };
 
 struct DIY_Tuple
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Tuple");
   diy_value_t *contents;
   size_t size;
+  diy_objproto_t *proto;
 };
 
 struct DIY_Array
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Array");
   diy_value_t *elements;
   size_t len, cap;
   bool is_assoc;
+  diy_objproto_t *proto;
 };
 
 struct DIY_Map
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Map");
   struct DIY_MapEntry
   {
     diy_value_t key;
@@ -75,49 +80,53 @@ struct DIY_Map
     struct DIY_MapEntry *next;
   } *entries;
   size_t size, cap;
+  diy_objproto_t *proto;
 };
 
 struct DIY_Bignum
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Bignum");
   diy_bitfield8_t *digits;
   size_t cnt;
-  diy_numbase_t base;
+  uint8_t base;
   diy_symbol_t source;
+  diy_objproto_t *proto;
 };
 
 struct DIY_Function
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Function");
   diy_funsig_t *sig;
-  diy_chunk_t *code;
+  diy_codechunk_t *code;
   diy_environ_t *env;
   diy_value_t *cnstpool;
-  diy_value_t *fields;
   size_t cnt_cnstpol, cap_cnstpool;
-  size_t cnt_fields, cap_fields;
   bool is_constructor;
+  diy_objproto_t *proto;
 };
 
 struct DIY_Closure
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Closure");
   diy_function_t *fn;
   diy_upvalue_t *upvals;
-  size_t upvals_cnt;
+  size_t upvals_cnt, upvals_cap;
   bool is_block;
+  diy_objproto_t *proto;
 };
 
 struct DIY_Upvalue
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Upvalue");
   diy_value_t *box;
   bool is_open;
+
+  struct DIY_Upvalue *next;
 };
 
 struct DIY_PEG
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("PEG");
   struct PEGProd
   {
     diy_symbol_t name;
@@ -125,14 +134,15 @@ struct DIY_PEG
     diy_closure_t *action;
     bool is_onfail;
   } *prods;
-  size_t cnt_prods;
-  size_t cap_prods;
+  size_t prods_cap;
+  size_t prods_cnt;
   diy_port_t *stream;
+  diy_objproto_t *proto;
 };
 
 struct DIY_Port
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Port");
   struct
   {
     uint8_t read : 1;
@@ -150,18 +160,19 @@ struct DIY_Port
     FILE *disk_io;
     diy_string_t *str_io;
   } as;
+  diy_objproto_t *proto;
 };
 
 struct DIY_NativeFn
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("NativeFn");
   diy_value_t (*handler) (int nformals, diy_value_t *formals);
   diy_symbol_t name;
 };
 
 struct DIY_Fiber
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Fiber");
   enum FiberState
   {
     FIBER_Init,
@@ -177,11 +188,12 @@ struct DIY_Fiber
   size_t cnt_args, cap_args;
 
   struct DIY_Fiber *next;
+  diy_objproto_t *proto;
 };
 
 struct DIY_Channel
 {
-  DIY_GC_HEADER;
+  DIY_GC_HEADER ("Channel");
   bool in, out;
   enum ChannelState
   {
@@ -196,6 +208,7 @@ struct DIY_Channel
   diy_value_t *data_out;
   size_t size_in, cap_in;
   size_t size_out, cap_out;
+  diy_objproto_t *proto;
 };
 
 #endif
